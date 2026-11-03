@@ -86,7 +86,49 @@ export function groupConvId(groupId: string): string {
   return `group:${groupId}`;
 }
 
-/** 解析会话 ID，得到发消息需要的 convType 和 to（单聊为对方）。 */
+const ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+
+/** 会话 ID 不合法（invalid），或者合法但自己不是参与者（notParticipant）。 */
+export class ConvIdError extends Error {
+  constructor(
+    readonly kind: 'invalid' | 'notParticipant',
+    convId: string,
+  ) {
+    super(`${kind} convId ${JSON.stringify(convId)}`);
+    this.name = 'ConvIdError';
+  }
+}
+
+/**
+ * 严格解析会话 ID（PRD-ui G-UI-03，用例 protocol/vectors/convid.json）：界面用它判断路由。
+ * 单聊必须恰好三段、两个 userId 合法且按 ASCII 字节序严格递增，其中一个是 self；群必须恰好两段且 groupId 合法；
+ * 一期没有聊天室，room 和其他前缀一律不合法。
+ */
+export function parseConvIdStrict(convId: string, self: string): { convType: 'c2c' | 'group'; to: string } {
+  const parts = convId.split(':');
+  if (parts[0] === 'c2c' && parts.length === 3) {
+    const [, a, b] = parts as [string, string, string];
+    if (!ID_RE.test(a) || !ID_RE.test(b) || !(a < b)) throw new ConvIdError('invalid', convId);
+    if (a !== self && b !== self) throw new ConvIdError('notParticipant', convId);
+    return { convType: 'c2c', to: a === self ? b : a };
+  }
+  if (parts[0] === 'group' && parts.length === 2 && ID_RE.test(parts[1]!)) {
+    return { convType: 'group', to: parts[1]! };
+  }
+  throw new ConvIdError('invalid', convId);
+}
+
+/** 单聊会话的对方 userId；群会话返回 null。 */
+export function peerId(conv: { convId: string; type: string }, self: string): string | null {
+  if (conv.type !== 'c2c') return null;
+  const [, a = '', b = ''] = conv.convId.split(':');
+  return a === self ? b : a;
+}
+
+/**
+ * 解析会话 ID，得到发消息需要的 convType 和 to（单聊为对方）。
+ * 只给 SDK 内部用：不校验格式和参与者，界面不得用它判断路由（用 parseConvIdStrict）。
+ */
 export function parseConvId(convId: string, self: string): { convType: ConvType; to: string } {
   const [type, a = '', b = ''] = convId.split(':');
   if (type === 'c2c') return { convType: 'c2c', to: a === self ? b : a };

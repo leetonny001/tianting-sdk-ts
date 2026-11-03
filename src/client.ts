@@ -82,6 +82,10 @@ type ClientEvents = {
   conversations: [Conversation[]];
   /** 某个会话的消息有变化。 */
   messages: [convId: string, messages: Message[]];
+  /** 全部会话的未读总数有变化（与 conversations 同一轮发出，PRD-ui G-UI-15）。 */
+  totalUnread: [number];
+  /** 发送中 / 排队 / 失败的消息总数有变化（退出登录确认、离开页面提示用，G-UI-20）。 */
+  pendingCount: [number];
   /** 被移出群（convRemoved），界面据此提示"你已不在该群"。 */
   convRemoved: [convId: string];
   /** 被踢或收到不应重连的关闭码，连接已停止，需要回到登录页（C-01）。 */
@@ -110,6 +114,8 @@ export class IMClient extends Emitter<ClientEvents> {
   private gapTimers = new Map<string, TimerHandle>();
   private active: string | null = null;
   private lastRead = -Infinity;
+  private lastTotalUnread = 0;
+  private lastPendingCount = 0;
   private readTimer: TimerHandle | null = null;
   private bannerTimer: TimerHandle | null = null;
   private bannerShown = false;
@@ -520,13 +526,41 @@ export class IMClient extends Emitter<ClientEvents> {
 
   // ---- 其他 ----
 
+  /** 全部会话的未读之和。 */
+  totalUnread(): number {
+    return this.store.conversations().reduce((n, c) => n + c.unread, 0);
+  }
+
+  /** 状态为 queued / sending / failed 的消息条数（跨会话）。 */
+  pendingCount(): number {
+    let n = 0;
+    for (const id of this.knownLists) {
+      for (const m of this.store.messages(id)) if (m.status !== 'sent') n++;
+    }
+    return n;
+  }
+
   private emitConversations(): void {
     this.emit('conversations', this.store.conversations());
+    const total = this.totalUnread();
+    if (total !== this.lastTotalUnread) {
+      this.lastTotalUnread = total;
+      this.emit('totalUnread', total);
+    }
   }
 
   private emitMessages(convId: string): void {
     this.knownLists.add(convId);
     this.emit('messages', convId, this.store.messages(convId));
+    this.emitPendingCount();
+  }
+
+  private emitPendingCount(): void {
+    const n = this.pendingCount();
+    if (n !== this.lastPendingCount) {
+      this.lastPendingCount = n;
+      this.emit('pendingCount', n);
+    }
   }
 
   private reset(): void {
@@ -540,6 +574,7 @@ export class IMClient extends Emitter<ClientEvents> {
     this.active = null;
     this.lastRead = -Infinity;
     this.emitConversations();
+    this.emitPendingCount();
   }
 
   private attachBrowserEvents(): void {

@@ -5,7 +5,15 @@ export { ConnectionClosedError, NotConnectedError, TimeoutError } from './connec
 export type { Conversation, Message, MessageStatus } from './store.js';
 export { CloseCode, ErrorCode, IMError, describeError, type ErrorCategory, type ErrorDescription } from './errors.js';
 export { MAX_TEXT_LENGTH, checkText, countCodePoints, trimText, type TextCheck } from './text.js';
-export { c2cConvId, groupConvId, type ConvType, type Platform } from './protocol.js';
+export {
+  ConvIdError,
+  c2cConvId,
+  groupConvId,
+  parseConvIdStrict,
+  peerId,
+  type ConvType,
+  type Platform,
+} from './protocol.js';
 export type { Clock } from './clock.js';
 export type { Logger } from './logger.js';
 export { WebSocketTransport, type Transport, type TransportConnection, type TransportHandlers } from './transport.js';
