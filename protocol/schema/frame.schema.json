@@ -663,7 +663,11 @@
             {
               "type": "object",
               "required": ["type", "convId"],
-              "properties": { "type": { "const": "convRemoved" }, "convId": { "$ref": "#/$defs/ConvId" } },
+              "properties": {
+                "type": { "const": "convRemoved" },
+                "convId": { "$ref": "#/$defs/ConvId" },
+                "reason": { "enum": ["removed", "dissolved", "left"], "description": "被移出 / 群被解散 / 主动退群（M4）；老服务端不带" }
+              },
               "additionalProperties": false
             },
             {
