@@ -1,0 +1,32 @@
+# 天听 TypeScript SDK 的 CI：格式、代码检查、类型检查、错误码生成文件与协议副本一致、单元测试、构建、依赖漏洞。
+# 集成测试需要 tianting-server 源码（私有仓库），CI 里要有读取它的凭证才能跑，见 README「集成测试」。
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  sdk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26
+          cache: npm
+      - run: npm ci
+      - name: 依赖漏洞（中危及以上阻断）
+        run: npm audit --audit-level=moderate
+      - run: npm run format:check
+      - run: npm run lint
+      - run: npm run typecheck
+      - name: errors.gen.ts 与 protocol/errors.json 一致
+        run: npm run check:protocol
+      - name: 单元测试（假传输层 + 假时钟）
+        run: npm test
+      - run: npm run build

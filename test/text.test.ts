@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { checkText, countCodePoints, trimText } from '../src/index.js';
 
-const spec = JSON.parse(readFileSync(new URL('../../protocol/vectors/text.json', import.meta.url), 'utf8')) as {
+const spec = JSON.parse(readFileSync(new URL('../protocol/vectors/text.json', import.meta.url), 'utf8')) as {
   cases: Array<{ name: string; input: string; trimmed: string; length: number }>;
 };
 

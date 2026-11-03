@@ -1,0 +1,6 @@
+node_modules
+dist
+protocol
+*.md
+package-lock.json
+src/errors.gen.ts

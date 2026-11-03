@@ -1,8 +1,8 @@
 {
-  "name": "@im-mvp/sdk",
+  "name": "@tianting/sdk",
   "version": "0.1.0",
   "private": true,
-  "description": "IM 统一 SDK（TypeScript）：H5 和 PC 共用的网络层与数据层，不依赖任何 UI 框架",
+  "description": "天听 IM 统一 SDK（TypeScript）：H5 和 PC 共用的网络层与数据层，不依赖任何 UI 框架",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -19,14 +19,24 @@
     "gen:errors": "node scripts/gen-errors.mjs",
     "test": "vitest run --project unit",
     "test:integration": "vitest run --project integration",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "check:protocol": "node scripts/gen-errors.mjs --check"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@types/node": "^26.6.6",
     "eslint": "^10.14.0",
+    "prettier": "^3.9.10",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.72.1",
     "vitest": "^5.1.0"
+  },
+  "engines": {
+    "node": ">=22.12"
+  },
+  "overrides": {
+    "minimatch": "^11.0.1"
   }
 }

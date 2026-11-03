@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { CloseCode, ErrorCode, describeError } from '../src/index.js';
 
-const spec = JSON.parse(readFileSync(new URL('../../protocol/errors.json', import.meta.url), 'utf8'));
+const spec = JSON.parse(readFileSync(new URL('../protocol/errors.json', import.meta.url), 'utf8'));
 
 describe('错误码（AC-SYS-01-3、AC-SYS-01-4、C-09）', () => {
   it('生成的枚举与 errors.json 完全一致', () => {

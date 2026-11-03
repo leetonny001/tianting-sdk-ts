@@ -1,9 +1,9 @@
 // 集成测试用的真实 im-server：编译 server/cmd/im-server，以测试模式启动在随机端口。
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
-import { mkdtempSync } from 'node:fs';
+import { existsSync, mkdtempSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 
 export const ADMIN_KEY = 'sdk-it-admin-key-0123456789abcdef';
 
@@ -26,12 +26,25 @@ async function freePort(): Promise<number> {
 
 let built: string | undefined;
 
+/**
+ * 服务端源码目录：环境变量 TIANTING_SERVER_DIR，否则找同级目录的 tianting-server（或旧名 im-mvp）检出。
+ */
+function serverDir(): string {
+  const env = process.env.TIANTING_SERVER_DIR;
+  const candidates = env ? [env] : ['../tianting-server/server', '../im-mvp/server'];
+  for (const c of candidates) {
+    const dir = resolve(c);
+    if (existsSync(join(dir, 'cmd/im-server'))) return dir;
+  }
+  throw new Error(`找不到 tianting-server 的 server 目录（试过 ${candidates.join('、')}），请设置 TIANTING_SERVER_DIR`);
+}
+
 function build(): string {
   if (built) return built;
   const dir = mkdtempSync(join(tmpdir(), 'im-sdk-it-'));
   built = join(dir, 'im-server');
   execFileSync('go', ['build', '-o', built, './cmd/im-server'], {
-    cwd: new URL('../../../server', import.meta.url),
+    cwd: serverDir(),
     stdio: 'inherit',
   });
   return built;
