@@ -103,14 +103,15 @@ export class ConvIdError extends Error {
 
 /**
  * 严格解析会话 ID（PRD-ui G-UI-03，用例 protocol/vectors/convid.json）：界面用它判断路由。
- * 单聊必须恰好三段、两个 userId 合法且按 ASCII 字节序严格递增，其中一个是 self；群必须恰好两段且 groupId 合法；
+ * 单聊必须恰好三段、两个 userId 合法且按 ASCII 字节序递增（相同时只能是 self 自己），其中一个是 self；群必须恰好两段且 groupId 合法；
  * 一期没有聊天室，room 和其他前缀一律不合法。
  */
 export function parseConvIdStrict(convId: string, self: string): { convType: 'c2c' | 'group'; to: string } {
   const parts = convId.split(':');
   if (parts[0] === 'c2c' && parts.length === 3) {
     const [, a, b] = parts as [string, string, string];
-    if (!ID_RE.test(a) || !ID_RE.test(b) || !(a < b)) throw new ConvIdError('invalid', convId);
+    if (!ID_RE.test(a) || !ID_RE.test(b) || a > b) throw new ConvIdError('invalid', convId);
+    // 两个 ID 相同只能是给自己发消息（F-MSG-01 规则 4、AC-UI-05-3，勘误 E-23）。
     if (a !== self && b !== self) throw new ConvIdError('notParticipant', convId);
     return { convType: 'c2c', to: a === self ? b : a };
   }
