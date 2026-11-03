@@ -39,6 +39,8 @@ export interface ServerConversation {
   unread: number;
   lastMsg: LastMsg | null;
   updatedAt: number;
+  /** 群成员数（PRD-core V-07）；单聊没有，旧服务端也可能没有。 */
+  memberCount?: number;
 }
 
 export interface SendAck {
@@ -66,7 +68,7 @@ export interface AuthAck {
 export type ServerEvent =
   | { type: 'kicked'; reason: string }
   | { type: 'convAdded'; conv: ServerConversation }
-  | { type: 'convRemoved'; convId: string }
+  | { type: 'convRemoved'; convId: string; reason?: string }
   | { type: 'readUpdated'; convId: string; readSeq: number };
 
 /** 下行帧。 */

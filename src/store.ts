@@ -31,6 +31,20 @@ export interface Conversation {
   unread: number;
   lastMsg: LastMsg | null;
   updatedAt: number;
+  /** 群成员数；字段缺失时为 undefined（界面只显示群名，不显示 0）。 */
+  memberCount?: number;
+}
+
+/**
+ * 被移出群后保留的会话快照（PRD-ui G-UI-21）：会话从列表里消失，但聊天页还能显示群名和"你已不在该群"。
+ * 保留到本次登录结束；reason 透传服务端的值（removed / dissolved / left / 不认识的值，或推断出来的没有 reason）。
+ */
+export interface ConversationSnapshot {
+  convId: string;
+  type: ConvType;
+  name: string;
+  removed: true;
+  reason?: string;
 }
 
 interface ConvState extends Conversation {
@@ -130,33 +144,88 @@ export class Store {
 
   // ---- 会话 ----
 
-  /** 用服务端的会话列表覆盖本地（convs 的结果）。 */
-  setConversations(list: ServerConversation[]): void {
+  /**
+   * 用服务端的会话列表覆盖本地（convs 的结果）。返回推断为"被移出"的群：原来在、新列表里没有的群会话
+   * （服务端不为离线期间的移出补发 convRemoved，G-UI-21 ②）。列表被截断时不推断，单聊不推断。
+   */
+  setConversations(list: ServerConversation[], truncated = false): string[] {
     const next = new Map<string, ConvState>();
     for (const c of list) next.set(c.convId, this.fromServer(c));
+    const gone: string[] = [];
+    if (!truncated) {
+      for (const [id, c] of this.convs) {
+        if (c.type === 'group' && !next.has(id) && !this.placeholders.has(id)) {
+          this.snapshots.set(id, { convId: id, type: c.type, name: c.name, removed: true });
+          gone.push(id);
+        }
+      }
+    }
+    for (const id of next.keys()) this.snapshots.delete(id);
     this.convs = next;
     this.placeholders.clear();
+    this.truncated = truncated;
+    return gone;
   }
+
+  /** 最近一次 convs 是否被截断（超过 500 个会话，C-03）。 */
+  truncated = false;
 
   upsertConversation(c: ServerConversation): void {
     this.convs.set(c.convId, this.fromServer(c));
     this.placeholders.delete(c.convId);
+    this.snapshots.delete(c.convId); // 重新被拉进群：清除快照（G-UI-21 ③）
   }
 
-  removeConversation(convId: string): void {
+  /** 被移出群：从列表移除并保留快照。 */
+  removeConversation(convId: string, reason?: string): void {
+    const c = this.convs.get(convId);
+    const snap: ConversationSnapshot = {
+      convId,
+      type: c?.type ?? (convId.startsWith('group:') ? 'group' : 'c2c'),
+      name: c?.name ?? convId.slice(convId.indexOf(':') + 1),
+      removed: true,
+    };
+    if (reason !== undefined) snap.reason = reason;
+    this.snapshots.set(convId, snap);
     this.convs.delete(convId);
+  }
+
+  private snapshots = new Map<string, ConversationSnapshot>();
+
+  snapshot(convId: string): ConversationSnapshot | undefined {
+    return this.snapshots.get(convId);
   }
 
   conversation(convId: string): Conversation | undefined {
     return this.convs.get(convId);
   }
 
-  /** 按 updatedAt 倒序、convId 升序（与服务端一致）。 */
+  /**
+   * 按 updatedAt 倒序、convId 升序（与服务端一致）。
+   * 快照引用稳定（G-UI-19）：没有变化的会话返回同一个对象，整体没有变化时返回同一个数组，界面可以按引用比较。
+   */
   conversations(): Conversation[] {
-    return [...this.convs.values()]
-      .sort((a, b) => b.updatedAt - a.updatedAt || (a.convId < b.convId ? -1 : a.convId > b.convId ? 1 : 0))
-      .map(({ readBase: _, ...c }) => c);
+    const sorted = [...this.convs.values()].sort(
+      (a, b) => b.updatedAt - a.updatedAt || (a.convId < b.convId ? -1 : a.convId > b.convId ? 1 : 0),
+    );
+    const prev = this.views;
+    const views = new Map<string, Conversation>();
+    let same = this.lastList !== null && this.lastList.length === sorted.length;
+    const list = sorted.map(({ readBase: _, ...c }, i) => {
+      const old = prev.get(c.convId);
+      const v = old && sameConversation(old, c) ? old : c;
+      views.set(c.convId, v);
+      if (same && this.lastList![i] !== v) same = false;
+      return v;
+    });
+    this.views = views;
+    if (same) return this.lastList!;
+    this.lastList = list;
+    return list;
   }
+
+  private views = new Map<string, Conversation>();
+  private lastList: Conversation[] | null = null;
 
   private fromServer(c: ServerConversation): ConvState {
     return { ...c, readBase: c.maxSeq - c.unread };
@@ -243,4 +312,26 @@ export class Store {
     this.placeholders.add(m.convId);
     return c;
   }
+}
+
+function sameLast(a: LastMsg | null, b: LastMsg | null): boolean {
+  if (a === b) return true;
+  return (
+    !!a && !!b && a.msgId === b.msgId && a.ts === b.ts && a.text === b.text && a.from === b.from && a.type === b.type
+  );
+}
+
+function sameConversation(a: Conversation, b: Conversation): boolean {
+  return (
+    a.convId === b.convId &&
+    a.type === b.type &&
+    a.name === b.name &&
+    a.maxSeq === b.maxSeq &&
+    a.readSeq === b.readSeq &&
+    a.minSeq === b.minSeq &&
+    a.unread === b.unread &&
+    a.updatedAt === b.updatedAt &&
+    a.memberCount === b.memberCount &&
+    sameLast(a.lastMsg, b.lastMsg)
+  );
 }

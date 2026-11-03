@@ -23,7 +23,7 @@ import {
   type ServerMessage,
   type SyncAck,
 } from './protocol.js';
-import { Store, type Conversation, type Message } from './store.js';
+import { Store, type Conversation, type ConversationSnapshot, type Message } from './store.js';
 import { checkText, type TextCheck } from './text.js';
 import { WebSocketTransport, type Transport } from './transport.js';
 
@@ -73,6 +73,7 @@ const DEFAULTS: IMClientTimings = {
 const MAX_CATCH_UP = 200;
 const PAGE = 200;
 const LATEST_PAGE = 20;
+const REFRESH_THROTTLE_MS = 30_000; // refreshConversations 的节流（G-UI-24）
 
 type ClientEvents = {
   /** 连接状态。 */
@@ -91,8 +92,11 @@ type ClientEvents = {
    * 不用在每次 messages 事件里比较前后状态。error 同 Message.error。
    */
   sendFailed: [convId: string, clientMsgId: string, error: NonNullable<Message['error']>];
-  /** 被移出群（convRemoved），界面据此提示"你已不在该群"。 */
-  convRemoved: [convId: string];
+  /**
+   * 被移出群（服务端的 convRemoved，或重连 / 刷新会话列表时推断出来的，G-UI-21），界面据此提示。
+   * reason 透传服务端的值（removed / dissolved / left / 不认识的值）；推断出来的没有 reason。
+   */
+  convRemoved: [convId: string, reason?: string];
   /** 被踢或收到不应重连的关闭码，连接已停止，需要回到登录页（C-01）。 */
   fatal: [FatalReason];
 };
@@ -230,6 +234,7 @@ export class IMClient extends Emitter<ClientEvents> {
     const list = this.store.list(convId);
     const conv = this.store.conversation(convId);
     if (!list.hasMoreHistory) return false;
+    if (!conv && list.oldestSeq === 0 && this.store.maxSeq(convId) === 0) return this.loadUnknown(convId, limit);
     const before = list.oldestSeq || Math.max(conv?.maxSeq ?? 0, this.store.maxSeq(convId)) + 1;
     if (before <= (conv?.minSeq ?? 1)) {
       list.hasMoreHistory = false;
@@ -240,6 +245,24 @@ export class IMClient extends Emitter<ClientEvents> {
     list.hasMoreHistory = ack.hasMore;
     this.emitMessages(convId);
     this.emitConversations();
+    return ack.hasMore;
+  }
+
+  /**
+   * 打开本地没有的会话（PRD-ui G-UI-26）：向服务端要最新一页，不按本地 minSeq 提前返回。
+   * 4032 / 4033 / 4043 以 IMError 抛给界面（"你已不在该群" / "群聊不存在或已解散"），不吞、不重试；
+   * 有消息时把会话补进列表；单聊没有消息时保持本地临时会话。
+   */
+  private async loadUnknown(convId: string, limit: number): Promise<boolean> {
+    const list = this.store.list(convId);
+    const ack = await this.conn.request<SyncAck>('sync', { convId, beforeSeq: Number.MAX_SAFE_INTEGER, limit });
+    for (const m of ack.messages) this.store.applyServerMessage(m);
+    list.hasMoreHistory = ack.hasMore;
+    this.emitMessages(convId);
+    if (ack.messages.length > 0) {
+      this.emitConversations();
+      this.refreshConversationsSoon(); // 用服务端数据替换临时补的会话
+    }
     return ack.hasMore;
   }
 
@@ -288,8 +311,7 @@ export class IMClient extends Emitter<ClientEvents> {
     this.flushQueued();
     try {
       const ack = await this.conn.request<ConvsAck>('convs', {});
-      this.store.setConversations(ack.convs);
-      this.emitConversations();
+      this.applyConvs(ack);
       for (const c of ack.convs) await this.catchUp(c);
       this.maybeReportRead();
     } catch (err) {
@@ -347,9 +369,9 @@ export class IMClient extends Emitter<ClientEvents> {
         this.emitConversations();
         return;
       case 'convRemoved':
-        this.store.removeConversation(ev.convId);
+        this.store.removeConversation(ev.convId, ev.reason);
         this.emitConversations();
-        this.emit('convRemoved', ev.convId);
+        this.emit('convRemoved', ev.convId, ev.reason);
         return;
       case 'readUpdated':
         if (this.store.advanceRead(ev.convId, ev.readSeq)) this.emitConversations();
@@ -379,15 +401,45 @@ export class IMClient extends Emitter<ClientEvents> {
       this.refreshTimer = null;
       this.conn
         .request<ConvsAck>('convs', {})
-        .then((ack) => {
-          this.store.setConversations(ack.convs);
-          this.emitConversations();
-        })
+        .then((ack) => this.applyConvs(ack))
         .catch((err) => this.log.warn(`im: refresh conversations failed: ${String(err)}`));
     }, 200);
   }
 
   private refreshTimer: TimerHandle | null = null;
+
+  /** 用 convs 的结果覆盖会话列表；原来在、新列表没有的群视为被移出（截断时不推断）。 */
+  private applyConvs(ack: ConvsAck): void {
+    const gone = this.store.setConversations(ack.convs, ack.truncated);
+    this.lastRefreshAt = this.clock.now();
+    this.emitConversations();
+    for (const id of gone) this.emit('convRemoved', id);
+  }
+
+  private lastRefreshAt = -Infinity;
+
+  /**
+   * 重新拉取会话列表（PRD-ui G-UI-24：进入群聊天页 / 聊天信息页时刷新成员数）。30 秒内只拉一次，
+   * 节流期内直接返回当前快照。
+   */
+  async refreshConversations(): Promise<Conversation[]> {
+    if (this.clock.now() - this.lastRefreshAt < REFRESH_THROTTLE_MS || this.conn.state !== 'connected') {
+      return this.store.conversations();
+    }
+    this.lastRefreshAt = this.clock.now();
+    this.applyConvs(await this.conn.request<ConvsAck>('convs', {}));
+    return this.store.conversations();
+  }
+
+  /** 最近一次会话列表是否被截断（只返回最近 500 个，C-03）。 */
+  truncated(): boolean {
+    return this.store.truncated;
+  }
+
+  /** 被移出群后保留的快照（本次登录期间有效）；没有被移出时返回 undefined。 */
+  conversationSnapshot(convId: string): ConversationSnapshot | undefined {
+    return this.store.snapshot(convId);
+  }
 
   private scheduleGapCheck(convId: string, after: number, until: number): void {
     if (this.gapTimers.has(convId)) return;

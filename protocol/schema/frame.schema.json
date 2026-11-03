@@ -236,7 +236,8 @@
         "minSeq": { "type": "integer", "minimum": 1, "description": "当前用户能拉到的最小 seq（群历史可见性）" },
         "unread": { "type": "integer", "minimum": 0 },
         "lastMsg": { "$ref": "#/$defs/LastMsg" },
-        "updatedAt": { "$ref": "#/$defs/TimestampMs" }
+        "updatedAt": { "$ref": "#/$defs/TimestampMs" },
+        "memberCount": { "type": "integer", "minimum": 0, "description": "群成员数（PRD-core V-07）；单聊不带。客户端遇到缺失时只显示群名" }
       },
       "additionalProperties": false
     },

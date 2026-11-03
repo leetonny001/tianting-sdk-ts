@@ -2,7 +2,8 @@
 export { IMClient, type IMClientOptions, type IMClientTimings, type SendResult } from './client.js';
 export type { ConnState, FatalReason } from './connection.js';
 export { ConnectionClosedError, NotConnectedError, TimeoutError } from './connection.js';
-export type { Conversation, Message, MessageStatus } from './store.js';
+export type { Conversation, ConversationSnapshot, Message, MessageStatus } from './store.js';
+export { avatarColorIndex, avatarInitial, fnv1a32 } from './avatar.js';
 export { CloseCode, ErrorCode, IMError, describeError, type ErrorCategory, type ErrorDescription } from './errors.js';
 export { MAX_TEXT_LENGTH, checkText, countCodePoints, trimText, type TextCheck } from './text.js';
 export {
