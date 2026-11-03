@@ -1,5 +1,5 @@
 # 天听 TypeScript SDK 的 CI：格式、代码检查、类型检查、错误码生成文件与协议副本一致、单元测试、构建、依赖漏洞。
-# 集成测试需要 tianting-server 源码（私有仓库），CI 里要有读取它的凭证才能跑，见 README「集成测试」。
+# 集成测试需要 tianting-server 源码（私有仓库）：配置了只读部署密钥 secret TIANTING_SERVER_DEPLOY_KEY 才跑，没配置时跳过（见 README「集成测试」）。
 name: ci
 
 on:
@@ -30,3 +30,39 @@ jobs:
       - name: 单元测试（假传输层 + 假时钟）
         run: npm test
       - run: npm run build
+
+  integration:
+    runs-on: ubuntu-latest
+    env:
+      HAS_KEY: ${{ secrets.TIANTING_SERVER_DEPLOY_KEY != '' }}
+    steps:
+      - name: 未配置只读部署密钥，跳过集成测试
+        if: env.HAS_KEY != 'true'
+        run: echo "::notice::未配置 TIANTING_SERVER_DEPLOY_KEY，跳过集成测试"
+      - uses: actions/checkout@v4
+        if: env.HAS_KEY == 'true'
+      - name: 检出 tianting-server（只读部署密钥）
+        if: env.HAS_KEY == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: leetonny001/tianting-server
+          ssh-key: ${{ secrets.TIANTING_SERVER_DEPLOY_KEY }}
+          path: tianting-server
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        if: env.HAS_KEY == 'true'
+        with:
+          node-version: 26
+          cache: npm
+      - uses: actions/setup-go@v5
+        if: env.HAS_KEY == 'true'
+        with:
+          go-version-file: tianting-server/server/go.mod
+          cache-dependency-path: tianting-server/server/go.sum
+      - run: npm ci
+        if: env.HAS_KEY == 'true'
+      - name: 集成测试（真实 im-server）
+        if: env.HAS_KEY == 'true'
+        run: npm run test:integration
+        env:
+          TIANTING_SERVER_DIR: tianting-server/server

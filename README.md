@@ -34,4 +34,11 @@ npm run test:integration       # 默认找同级目录 ../tianting-server/server
 TIANTING_SERVER_DIR=/path/to/tianting-server/server npm run test:integration
 ```
 
-CI 暂不跑集成测试：tianting-server 是私有仓库，需要配置读取凭证（待授权）。
+CI 里的集成测试需要读取私有仓库 tianting-server：在 tianting-server 添加一个**只读**部署密钥（Deploy key），把私钥存为本仓库的 Actions secret `TIANTING_SERVER_DEPLOY_KEY`。没配置时 CI 跳过集成测试，只跑单元测试。
+
+```bash
+ssh-keygen -t ed25519 -N '' -C tianting-sdk-ts-ci -f /tmp/tianting-ci-key
+gh repo deploy-key add /tmp/tianting-ci-key.pub -R leetonny001/tianting-server -t tianting-sdk-ts-ci
+gh secret set TIANTING_SERVER_DEPLOY_KEY -R leetonny001/tianting-sdk-ts < /tmp/tianting-ci-key
+rm /tmp/tianting-ci-key /tmp/tianting-ci-key.pub
+```
