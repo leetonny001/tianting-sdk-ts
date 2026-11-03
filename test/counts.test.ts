@@ -53,3 +53,25 @@ describe('未读总数与待发送条数（FE-201、G-UI-15、G-UI-20）', () =>
     expect(h.im.pendingCount()).toBe(0);
   });
 });
+
+describe('sendFailed 事件（FE-202、G-UI-22）', () => {
+  it('每次失败只发一次：4290 → 重发 → 再次 4290 共两次；超时一次；晚到的 ack 不再发', async () => {
+    const h = setup();
+    const got: string[] = [];
+    h.im.on('sendFailed', (convId, id, err) => got.push(`${convId}/${id}/${err}`));
+    h.im.connect('t');
+    const c = await h.login('alice', [conv({ convId: AB })]);
+    h.im.send(AB, 'hi');
+    c.ackError('send', 4290);
+    await flush();
+    h.im.retry(AB, 'cid-0001');
+    c.ackError('send', 4290);
+    await flush();
+    h.im.send(AB, 'later');
+    h.clock.advance(10_000);
+    await flush();
+    c.ack('send', { msgId: 'm2', convId: AB, seq: 1, ts: 1 });
+    await flush();
+    expect(got).toEqual([`${AB}/cid-0001/4290`, `${AB}/cid-0001/4290`, `${AB}/cid-0002/timeout`]);
+  });
+});

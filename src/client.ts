@@ -86,6 +86,11 @@ type ClientEvents = {
   totalUnread: [number];
   /** 发送中 / 排队 / 失败的消息总数有变化（退出登录确认、离开页面提示用，G-UI-20）。 */
   pendingCount: [number];
+  /**
+   * 一条消息这一次发送失败（PRD-ui G-UI-22）：每次失败只发一次，界面据此弹一次轻提示，
+   * 不用在每次 messages 事件里比较前后状态。error 同 Message.error。
+   */
+  sendFailed: [convId: string, clientMsgId: string, error: NonNullable<Message['error']>];
   /** 被移出群（convRemoved），界面据此提示"你已不在该群"。 */
   convRemoved: [convId: string];
   /** 被踢或收到不应重连的关闭码，连接已停止，需要回到登录页（C-01）。 */
@@ -417,6 +422,7 @@ export class IMClient extends Emitter<ClientEvents> {
     const pending = list.pendingMessages();
     for (const m of pending) list.update(m.clientMsgId, { status: 'failed', error: 'kicked' });
     if (pending.length) this.emitMessages(convId);
+    for (const m of pending) this.emit('sendFailed', convId, m.clientMsgId, 'kicked');
   }
 
   // ---- 发送 ----
@@ -477,6 +483,7 @@ export class IMClient extends Emitter<ClientEvents> {
     if (!m || m.status !== 'sending') return; // 已经被晚到的 ack 更新为已发送
     this.store.list(convId).update(clientMsgId, { status: 'failed', error });
     this.emitMessages(convId);
+    if (error !== undefined) this.emit('sendFailed', convId, clientMsgId, error);
   }
 
   /** 重连后发出排队的消息，每条只自动发一次。 */
