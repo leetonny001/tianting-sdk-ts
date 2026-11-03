@@ -53,11 +53,13 @@ function build(): string {
 export async function startServer(env: Record<string, string> = {}): Promise<RunningServer> {
   const bin = build();
   const port = await freePort();
+  const adminPort = await freePort(); // 管理接口在单独的端口上（tianting-server PRD-admin F-KEY-01）
   const dir = mkdtempSync(join(tmpdir(), 'im-sdk-db-'));
   const proc: ChildProcess = spawn(bin, [], {
     env: {
       ...process.env,
       IM_ADDR: `127.0.0.1:${port}`,
+      IM_ADMIN_ADDR: `127.0.0.1:${adminPort}`,
       IM_DB: join(dir, 'im.db'),
       IM_ADMIN_KEY: ADMIN_KEY,
       IM_JWT_SECRET: 'sdk-it-jwt-secret-0123456789',
@@ -78,7 +80,7 @@ export async function startServer(env: Record<string, string> = {}): Promise<Run
     await new Promise((r) => setTimeout(r, 50));
   }
   const admin = async (method: string, path: string, body?: unknown) => {
-    const res = await fetch(base + path, {
+    const res = await fetch(`http://127.0.0.1:${adminPort}${path}`, {
       method,
       headers: { 'X-Admin-Key': ADMIN_KEY, 'Content-Type': 'application/json' },
       body: body === undefined ? undefined : JSON.stringify(body),
