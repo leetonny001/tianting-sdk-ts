@@ -16,6 +16,7 @@
     { "code": 4011, "name": "TOKEN_EXPIRED",               "http": null, "scope": ["ws"],          "retryable": false, "message": "登录凭证已过期",       "action": "不重连，提示「登录已过期」，回登录页" },
     { "code": 4012, "name": "TOKEN_REVOKED",               "http": null, "scope": ["ws"],          "retryable": false, "message": "账号已被强制下线",     "action": "不重连，提示「账号已被下线」，回登录页" },
     { "code": 4013, "name": "ADMIN_KEY_INVALID",           "http": 401, "scope": ["admin"],        "retryable": false, "message": "管理密钥无效",         "action": "业务服务端检查配置" },
+    { "code": 4017, "name": "ADMIN_SIGNATURE_INVALID",     "http": 401, "scope": ["admin"],        "retryable": false, "message": "管理接口签名无效",     "action": "业务服务端检查时钟、调用方密钥和签名（缺签名头、调用方不存在或停用、签名错误、时间戳超出 5 分钟、nonce 重复、目标节点不符）" },
     { "code": 4030, "name": "FORBIDDEN",                   "http": 403, "scope": ["ws", "admin"], "retryable": false, "message": "无权限",               "action": "提示「无权限」" },
     { "code": 4031, "name": "MUTED",                       "http": null, "scope": ["ws"],          "retryable": false, "message": "已被禁言",             "action": "二期：提示「你已被禁言」并显示解除时间" },
     { "code": 4032, "name": "NOT_CONV_PARTICIPANT",        "http": null, "scope": ["ws"],          "retryable": false, "message": "不是该会话的参与者",   "action": "开发期缺陷，记录日志" },
