@@ -23,6 +23,22 @@ import {
   type ServerMessage,
   type SyncAck,
 } from './protocol.js';
+import {
+  ProfileCache,
+  SocialState,
+  type ApplySource,
+  type BlockedUser,
+  type Friend,
+  type FriendRequest,
+  type MyGroup,
+  type Relation,
+  type SearchedUser,
+  type SocialChangeAck,
+  type SocialItems,
+  type SocialSettings,
+  type SocialSyncAck,
+  type UserProfile,
+} from './social.js';
 import { Store, type Conversation, type ConversationSnapshot, type Message } from './store.js';
 import { checkText, type TextCheck } from './text.js';
 import { WebSocketTransport, type Transport } from './transport.js';
@@ -99,7 +115,28 @@ type ClientEvents = {
   convRemoved: [convId: string, reason?: string];
   /** 被踢或收到不应重连的关闭码，连接已停止，需要回到登录页（C-01）。 */
   fatal: [FatalReason];
+  // ---- 社交（PRD-social 10.1 节）：每次本地社交状态变化时四个一起发出（快照引用在没有变化时保持不变） ----
+  /** 好友（不含墓碑）。 */
+  friends: [Friend[]];
+  /** "新的朋友"（30 天内，按 updatedAt 倒序）与红点数。 */
+  friendRequests: [{ items: FriendRequest[]; unseen: number }];
+  blocks: [BlockedUser[]];
+  socialSettings: [SocialSettings];
 };
+
+/** 社交命令的选项。 */
+export interface ApplyFriendOptions {
+  message?: string;
+  source?: ApplySource;
+  /** source=group 时为 groupId。 */
+  sourceRef?: string;
+  /** 对方同意后我给对方的备注。 */
+  remark?: string;
+}
+
+const SOCIAL_DEBOUNCE_MS = 200; // socialChanged 去抖（F-SOC-06 规则 6）
+const SOCIAL_PAGE = 500;
+const USERS_BATCH = 100;
 
 export type SendResult = { ok: true; message: Message } | Exclude<TextCheck, { ok: true }>;
 
@@ -129,6 +166,18 @@ export class IMClient extends Emitter<ClientEvents> {
   private bannerTimer: TimerHandle | null = null;
   private bannerShown = false;
   private detach: (() => void) | null = null;
+  private social = new SocialState();
+  private profiles: ProfileCache;
+  private serverOffset = 0; // 服务端时间 − 本地时间（auth ack 的 serverTime）
+  private socialTimer: TimerHandle | null = null;
+  private socialRunning: Promise<void> | null = null;
+  private socialSnap: {
+    friends: Friend[];
+    requests: { items: FriendRequest[]; unseen: number };
+    blocks: BlockedUser[];
+    settings: SocialSettings;
+  };
+  private usersQueue = new Map<string, Array<() => void>>();
 
   constructor(o: IMClientOptions) {
     super();
@@ -139,6 +188,13 @@ export class IMClient extends Emitter<ClientEvents> {
     this.isVisible = o.isVisible ?? (() => typeof document === 'undefined' || document.visibilityState !== 'hidden');
     this.onListenerError = (err) => this.log.error('im: listener error', err);
     this.store = new Store(() => this.self);
+    this.profiles = new ProfileCache(() => this.clock.now());
+    this.socialSnap = {
+      friends: [],
+      requests: { items: [], unseen: 0 },
+      blocks: [],
+      settings: { ...this.social.settings },
+    };
     this.conn = new Connection({
       url: o.url,
       platform: o.platform ?? 'web',
@@ -308,6 +364,7 @@ export class IMClient extends Emitter<ClientEvents> {
   private async onConnected(a: AuthAck): Promise<void> {
     if (this.self && this.self !== a.userId) this.reset(); // 换了账号
     this.self = a.userId;
+    this.serverOffset = a.serverTime - this.clock.now();
     this.flushQueued();
     try {
       const ack = await this.conn.request<ConvsAck>('convs', {});
@@ -317,6 +374,9 @@ export class IMClient extends Emitter<ClientEvents> {
     } catch (err) {
       this.log.warn(`im: initial sync failed: ${String(err)}`);
     }
+    // 先 convs，再从本地 socialVer 开始一轮关系同步（F-SOC-06 规则 10）。
+    this.social.needSync = true;
+    void this.syncSocial();
   }
 
   /**
@@ -376,6 +436,15 @@ export class IMClient extends Emitter<ClientEvents> {
       case 'readUpdated':
         if (this.store.advanceRead(ev.convId, ev.readSeq)) this.emitConversations();
         return;
+      case 'socialChanged':
+        this.social.onSocialChanged(ev.ver);
+        if (this.social.needSync) this.syncSocialSoon();
+        return;
+      case 'socialSettingsChanged':
+        this.social.settings = { ...this.social.settings, mode: ev.mode, strangerMsgLimit: ev.strangerMsgLimit };
+        this.emitSocial();
+        return;
+      // 不认识的事件类型忽略（协议 README 第 3 节规则 9）。
     }
   }
 
@@ -465,6 +534,7 @@ export class IMClient extends Emitter<ClientEvents> {
 
   /** 被踢或不可重连的关闭：发送中 / 排队的消息全部标记失败（AC-AUTH-03-6），通知界面回到登录页。 */
   private onFatal(r: FatalReason): void {
+    this.clearSocial(); // 被踢：清空全部社交状态（PRD-social 10.2 节）
     for (const c of this.store.conversations()) this.failPending(c.convId);
     this.emit('fatal', r);
   }
@@ -628,12 +698,268 @@ export class IMClient extends Emitter<ClientEvents> {
     if (this.readTimer !== null) this.clock.clearTimeout(this.readTimer);
     this.readTimer = null;
     this.store = new Store(() => this.self);
+    this.clearSocial();
     this.knownLists.clear();
     this.autoUsed.clear();
     this.active = null;
     this.lastRead = -Infinity;
     this.emitConversations();
     this.emitPendingCount();
+  }
+
+  // ---- 社交（PRD-social FE-101～FE-103） ----
+
+  /** 按服务端时间的"现在"：申请过期、30 天都用它判断，不用本地时钟（PRD-core 3.1 节）。 */
+  serverNow(): number {
+    return this.clock.now() + this.serverOffset;
+  }
+
+  friends(): Friend[] {
+    return this.socialSnap.friends;
+  }
+
+  friendRequests(): { items: FriendRequest[]; unseen: number } {
+    return this.socialSnap.requests;
+  }
+
+  blocks(): BlockedUser[] {
+    return this.socialSnap.blocks;
+  }
+
+  socialSettings(): SocialSettings {
+    return this.socialSnap.settings;
+  }
+
+  /** 是否完成过至少一轮关系同步（通讯录首轮未结束时显示骨架屏）。 */
+  socialLoaded(): boolean {
+    return this.social.loaded;
+  }
+
+  /** 我自己是否为官方账号。 */
+  isOfficial(): boolean {
+    return this.social.official;
+  }
+
+  /** 只看本地的关系（与 userSearch 的 relation 同一枚举）。 */
+  relationOf(userId: string): Relation {
+    return this.social.relationOf(userId, this.self, this.serverNow());
+  }
+
+  /** 最近一次拿到的资料（缓存，可能已过期；没有为 undefined）。 */
+  profileOf(userId: string): UserProfile | undefined {
+    return this.profiles.last(userId);
+  }
+
+  /** 显示名：好友备注 → 昵称 → userId（备注只在本机显示，PRD-social 5.5 节）。 */
+  displayName(userId: string): string {
+    const f = this.social.friends.get(userId);
+    if (f && !f.deleted && f.remark) return f.remark;
+    return this.profiles.last(userId)?.nickname || userId;
+  }
+
+  async applyFriend(userId: string, opts: ApplyFriendOptions = {}): Promise<'pending' | 'accepted'> {
+    const ack = await this.socialCmd('friendApply', { to: userId, ...opts });
+    return ack.status ?? 'pending';
+  }
+
+  async respondFriend(userId: string, action: 'accept' | 'reject', opts: { remark?: string } = {}): Promise<void> {
+    await this.socialCmd('friendRespond', { from: userId, action, ...opts });
+  }
+
+  async deleteFriend(userId: string): Promise<void> {
+    await this.socialCmd('friendDelete', { userId });
+  }
+
+  async setFriendRemark(userId: string, remark: string): Promise<void> {
+    await this.socialCmd('friendRemark', { userId, remark });
+  }
+
+  async block(userId: string): Promise<void> {
+    await this.socialCmd('block', { userId });
+  }
+
+  async unblock(userId: string): Promise<void> {
+    await this.socialCmd('unblock', { userId });
+  }
+
+  /** 进入"新的朋友"时调用：本地红点立即清零，上报当前 socialVer（F-SOC-04 规则 3）。 */
+  markFriendRequestsSeen(): void {
+    const ver = this.social.ver;
+    if (ver <= this.social.requestSeenVer) return;
+    this.social.requestSeenVer = ver;
+    this.emitSocial();
+    this.conn
+      .request<{ requestSeenVer: number; ver: number; changed: boolean }>('friendRequestsSeen', { ver })
+      .then((ack) => {
+        this.social.applyAck(ack.ver, ack.changed);
+        this.afterSocialAck();
+      })
+      .catch((err) => this.log.warn(`im: friendRequestsSeen failed: ${String(err)}`));
+  }
+
+  async setSearchable(searchable: boolean): Promise<void> {
+    const ack = await this.conn.request<{ ver: number; changed: boolean }>('setPrivacy', { searchable });
+    this.social.settings = { ...this.social.settings, searchable };
+    this.social.applyAck(ack.ver, ack.changed);
+    this.afterSocialAck();
+  }
+
+  /** 精确搜索 userId（不存在、不可被搜索都是 null）。结果里的资料写进缓存，供申请页 / 资料卡使用。 */
+  async searchUser(keyword: string): Promise<SearchedUser | null> {
+    const ack = await this.conn.request<{ user: SearchedUser | null }>('userSearch', { keyword });
+    if (ack.user) this.profiles.put(ack.user);
+    return ack.user;
+  }
+
+  /**
+   * 批量查资料（F-SOC-10）：命中缓存的不请求；同一事件循环内的调用合并，每批最多 100 个。
+   * 返回可见的用户；不在可见范围内、不存在的不返回（两者无法区分）。
+   */
+  async getUsers(userIds: string[]): Promise<UserProfile[]> {
+    const ids = [...new Set(userIds)];
+    const missing = ids.filter((id) => !this.profiles.fresh(id));
+    if (missing.length) {
+      const first = this.usersQueue.size === 0;
+      const done = new Promise<void>((resolve) => {
+        for (const id of missing) {
+          const waiters = this.usersQueue.get(id) ?? [];
+          waiters.push(resolve);
+          this.usersQueue.set(id, waiters);
+        }
+      });
+      if (first) queueMicrotask(() => void this.flushUsers());
+      await done;
+    }
+    return ids.map((id) => this.profiles.fresh(id)).filter((p): p is UserProfile => !!p);
+  }
+
+  private async flushUsers(): Promise<void> {
+    const queue = this.usersQueue;
+    this.usersQueue = new Map();
+    const ids = [...queue.keys()];
+    for (let i = 0; i < ids.length; i += USERS_BATCH) {
+      const batch = ids.slice(i, i + USERS_BATCH);
+      try {
+        const ack = await this.conn.request<{ users: UserProfile[] }>('users', { userIds: batch });
+        for (const u of ack.users) this.profiles.put(u);
+      } catch (err) {
+        this.log.warn(`im: users failed: ${String(err)}`);
+      }
+      for (const id of batch) for (const resolve of queue.get(id) ?? []) resolve();
+    }
+  }
+
+  /** 我的群聊（F-SOC-11）：自动翻完全部页，按 groupId 升序。 */
+  async loadMyGroups(): Promise<MyGroup[]> {
+    const out: MyGroup[] = [];
+    let cursor = '';
+    for (;;) {
+      const ack = await this.conn.request<{ groups: MyGroup[]; nextCursor: string }>(
+        'myGroups',
+        cursor ? { cursor } : {},
+      );
+      out.push(...ack.groups);
+      if (!ack.nextCursor) return out;
+      cursor = ack.nextCursor;
+    }
+  }
+
+  private async socialCmd(cmd: string, data: Record<string, unknown>): Promise<SocialChangeAck> {
+    const ack = await this.conn.request<SocialChangeAck>(cmd, data);
+    this.cacheProfiles(ack.items);
+    this.social.applyAck(ack.ver, ack.changed, ack.items);
+    this.afterSocialAck();
+    return ack;
+  }
+
+  private afterSocialAck(): void {
+    this.emitSocial();
+    if (this.social.needSync) void this.syncSocial();
+  }
+
+  private cacheProfiles(items: SocialItems): void {
+    for (const f of items.friends) this.profiles.putProfile(f.userId, f.profile);
+    for (const r of items.requests) this.profiles.putProfile(r.userId, r.profile);
+    for (const b of items.blocks) this.profiles.putProfile(b.userId, b.profile);
+  }
+
+  private syncSocialSoon(): void {
+    if (this.socialTimer !== null) return;
+    this.socialTimer = this.clock.setTimeout(() => {
+      this.socialTimer = null;
+      void this.syncSocial();
+    }, SOCIAL_DEBOUNCE_MS);
+  }
+
+  /** 跑同步轮直到不再需要（F-SOC-06 规则 3、8）。同一时刻只有一个在跑；期间收到的事件在本轮结束后处理。 */
+  private syncSocial(): Promise<void> {
+    if (this.socialRunning) return this.socialRunning;
+    const run = async () => {
+      for (let rounds = 0; this.social.needSync && this.conn.state === 'connected' && rounds < 20; rounds++) {
+        const since = this.social.beginRound();
+        let data: Record<string, unknown> = { sinceVer: since, limit: SOCIAL_PAGE };
+        try {
+          for (;;) {
+            const page = await this.conn.request<SocialSyncAck>('socialSync', data);
+            this.cacheProfiles(page);
+            const next = this.social.applyPage(page);
+            if (next === 'done') break;
+            data =
+              next === 'continue'
+                ? { cursor: page.cursor, limit: SOCIAL_PAGE }
+                : { sinceVer: since, limit: SOCIAL_PAGE };
+          }
+        } catch (err) {
+          this.social.abortRound();
+          this.log.warn(`im: socialSync failed: ${String(err)}`);
+          break; // 下一次事件或重连时再同步
+        }
+        this.emitSocial();
+      }
+    };
+    this.socialRunning = run().finally(() => {
+      this.socialRunning = null;
+    });
+    return this.socialRunning;
+  }
+
+  /** 重新计算社交快照并发出四个事件。 */
+  private emitSocial(): void {
+    const now = this.serverNow();
+    const s = this.social;
+    const friends: Friend[] = [];
+    for (const f of s.friends.values()) {
+      if (f.deleted) continue;
+      const name = f.remark || f.profile?.nickname || this.profiles.last(f.userId)?.nickname || f.userId;
+      friends.push({ ...f, displayName: name, blocked: s.isBlocked(f.userId) });
+    }
+    const items: FriendRequest[] = s.requestList(now).map((r) => {
+      const p = r.profile ?? this.profiles.last(r.userId) ?? null; // 发出的申请对方同意前没有资料：用手里已有的
+      return { ...r, displayName: p?.nickname || r.userId };
+    });
+    const blocks: BlockedUser[] = [];
+    for (const b of s.blocks.values()) {
+      if (!b.deleted) blocks.push({ ...b, displayName: b.profile?.nickname || b.userId });
+    }
+    blocks.sort((a, b) => b.createdAt - a.createdAt);
+    this.socialSnap = {
+      friends,
+      requests: { items, unseen: s.unseen(now) },
+      blocks,
+      settings: { ...s.settings },
+    };
+    this.emit('friends', friends);
+    this.emit('friendRequests', this.socialSnap.requests);
+    this.emit('blocks', blocks);
+    this.emit('socialSettings', this.socialSnap.settings);
+  }
+
+  private clearSocial(): void {
+    if (this.socialTimer !== null) this.clock.clearTimeout(this.socialTimer);
+    this.socialTimer = null;
+    this.social.clear();
+    this.profiles.clear();
+    this.emitSocial();
   }
 
   private attachBrowserEvents(): void {

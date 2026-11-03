@@ -1,4 +1,4 @@
-// 协议类型（protocol/schema/frame.schema.json v1，PRD v1.2）。
+// 协议类型（protocol/schema/frame.schema.json v1，PRD-core v1.3；社交类型在 social.ts）。
 
 export type ConvType = 'c2c' | 'group' | 'room';
 export type Platform = 'android' | 'ios' | 'web' | 'pc';
@@ -69,7 +69,9 @@ export type ServerEvent =
   | { type: 'kicked'; reason: string }
   | { type: 'convAdded'; conv: ServerConversation }
   | { type: 'convRemoved'; convId: string; reason?: string }
-  | { type: 'readUpdated'; convId: string; readSeq: number };
+  | { type: 'readUpdated'; convId: string; readSeq: number }
+  | { type: 'socialChanged'; ver: number }
+  | { type: 'socialSettingsChanged'; mode: 'open' | 'friends'; strangerMsgLimit: number };
 
 /** 下行帧。 */
 export interface InboundFrame {

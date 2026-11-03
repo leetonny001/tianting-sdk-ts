@@ -120,6 +120,85 @@ describe('SDK × 真实服务端', () => {
   });
 });
 
+describe('SDK × 真实服务端：社交（PRD-social FE-101～FE-103）', () => {
+  it('申请 → 对方红点 → 同意 → 双方好友列表；多端同步', async () => {
+    await srv.admin('POST', '/admin/users/import', {
+      users: [
+        { userId: 's1a', nickname: '小A' },
+        { userId: 's1b', nickname: '小B' },
+      ],
+    });
+    const a = await login('s1a');
+    const b = await login('s1b');
+    const bPc = await login('s1b');
+    await until(() => a.socialLoaded() && b.socialLoaded() && bPc.socialLoaded(), 'first social round');
+    const found = await a.searchUser('s1b');
+    expect(found).toMatchObject({ nickname: '小B', relation: 'none' });
+    expect(await a.applyFriend('s1b', { message: '我是小A', source: 'search' })).toBe('pending');
+    expect(a.relationOf('s1b')).toBe('pendingOut');
+    expect(a.friendRequests().items[0]).toMatchObject({
+      userId: 's1b',
+      direction: 'out',
+      displayName: '小B',
+      profile: null,
+    });
+    await until(
+      () => b.friendRequests().unseen === 1 && bPc.friendRequests().unseen === 1,
+      'b red dot on both devices',
+    );
+    expect(b.friendRequests().items[0]).toMatchObject({
+      userId: 's1a',
+      direction: 'in',
+      message: '我是小A',
+      displayName: '小A',
+    });
+    b.markFriendRequestsSeen();
+    await until(() => bPc.friendRequests().unseen === 0, 'red dot cleared on the other device');
+    await b.respondFriend('s1a', 'accept', { remark: '同学A' });
+    expect(b.friends().map((f) => f.displayName)).toEqual(['同学A']);
+    await until(() => a.friends().length === 1 && bPc.friends().length === 1, 'friends on both sides');
+    expect(a.relationOf('s1b')).toBe('friend');
+    expect(bPc.friends()[0]?.displayName).toBe('同学A');
+  });
+
+  it('拉黑：对方私聊 4036 标记失败、不自动重发；黑名单多端同步', async () => {
+    const a = await login('s2a');
+    const aPc = await login('s2a');
+    const b = await login('s2b');
+    await until(() => a.socialLoaded() && aPc.socialLoaded(), 'loaded');
+    await a.block('s2b');
+    expect(a.relationOf('s2b')).toBe('blocked');
+    await until(() => aPc.blocks()[0]?.userId === 's2b', 'block synced');
+    const conv = c2cConvId('s2a', 's2b');
+    b.send(conv, 'hi');
+    const m = await until(() => b.messages(conv).find((x) => x.status === 'failed'), 'failed');
+    expect(m.error).toBe(4036);
+    await new Promise((r) => setTimeout(r, 300));
+    expect(b.messages(conv)).toHaveLength(1);
+    await a.unblock('s2b');
+    await until(() => aPc.blocks().length === 0, 'unblock synced');
+  });
+
+  it('getUsers 只返回可见的人；loadMyGroups；被管理接口移出群 reason=removed', async () => {
+    await srv.admin('POST', '/admin/users/import', { users: [{ userId: 's3b', nickname: '群友' }, { userId: 's3c' }] });
+    const a = await login('s3a');
+    for (const g of ['s3g1', 's3g2', 's3g3'])
+      await srv.admin('POST', '/admin/groups', { groupId: g, name: g, members: ['s3a', 's3b'] });
+    expect((await a.loadMyGroups()).map((g) => [g.groupId, g.memberCount])).toEqual([
+      ['s3g1', 2],
+      ['s3g2', 2],
+      ['s3g3', 2],
+    ]);
+    expect((await a.getUsers(['s3b', 's3c', 'nobody'])).map((u) => u.nickname)).toEqual(['群友']);
+    const removed: Array<[string, string | undefined]> = [];
+    a.on('convRemoved', (id, reason) => removed.push([id, reason]));
+    await until(() => a.conversations().some((c) => c.convId === 'group:s3g1'), 'convs');
+    await srv.admin('DELETE', '/admin/groups/s3g1/members', { members: ['s3a'] });
+    await until(() => removed.length > 0, 'convRemoved');
+    expect(removed[0]).toEqual(['group:s3g1', 'removed']);
+  });
+});
+
 describe('SDK × 真实服务端：断线重连与补拉', () => {
   let idle: RunningServer;
   beforeAll(async () => {

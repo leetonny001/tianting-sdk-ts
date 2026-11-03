@@ -6,6 +6,29 @@
 - SDK 设计说明（三套 SDK 的行为基准）：tianting-server 的 `docs/sdk/README.md`
 - 同一套行为规则的其他实现：[tianting-sdk-kotlin](https://github.com/leetonny001/tianting-sdk-kotlin)、[tianting-sdk-swift](https://github.com/leetonny001/tianting-sdk-swift)
 
+## 社交（PRD-social M3）
+
+```ts
+im.on('friends', (list) => …);                         // 好友（displayName = 备注 → 昵称 → userId，blocked 标记）
+im.on('friendRequests', ({ items, unseen }) => …);     // 新的朋友（30 天内，updatedAt 倒序）+ 红点
+im.on('blocks', (list) => …);
+im.on('socialSettings', ({ searchable, mode, strangerMsgLimit }) => …);
+
+await im.applyFriend(userId, { message, source, sourceRef, remark }); // → 'pending' | 'accepted'
+await im.respondFriend(userId, 'accept' | 'reject', { remark });
+await im.deleteFriend(userId); await im.setFriendRemark(userId, remark);
+await im.block(userId); await im.unblock(userId);
+im.markFriendRequestsSeen();                           // 本地红点立即清零
+im.relationOf(userId);                                 // self > blocked > friend > pendingIn > pendingOut > none
+await im.searchUser(keyword); await im.setSearchable(bool);
+await im.getUsers(userIds);                            // 资料缓存 10 分钟，同一事件循环内合并、每批 100
+await im.loadMyGroups();
+messageFor(cmd, code, { strangerMsgLimit });           // "命令 + 错误码"文案
+```
+
+快照读取：`friends()`、`friendRequests()`、`blocks()`、`socialSettings()`、`socialLoaded()`、`profileOf(userId)`、`displayName(userId)`。
+同步规则（PRD-social 10.2 节）由纯状态机 `SocialState` 实现，跑共享用例 `protocol/vectors/social.json`（与服务端的 Go 参考客户端同一份）。失败的命令抛出 `IMError`（`code` 透传）。
+
 ## 开发
 
 需要 Node 22.12+。

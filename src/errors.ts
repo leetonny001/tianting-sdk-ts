@@ -47,3 +47,33 @@ export class IMError extends Error {
     return describeError(this.code);
   }
 }
+
+/**
+ * "命令 + 错误码"文案（PRD-social 9.4 节、ERRORS.md 第 2 节；用例 protocol/vectors/social.json 的 copy）。
+ * 这里只列与命令相关的码；没有列出的返回 undefined，界面用该码的默认文案。
+ * strangerMsgLimit 填进 4137 的 N（取最近一次同步 / 事件中的值）。
+ */
+export function messageFor(cmd: string, code: number, ctx: { strangerMsgLimit?: number } = {}): string | undefined {
+  const t = COPY[`${cmd}:${code}`] ?? COPY[`*:${code}`];
+  return t?.replace('{N}', String(ctx.strangerMsgLimit ?? 0));
+}
+
+const DAILY = '今天的次数已用完，明天再试';
+const COPY: Readonly<Record<string, string>> = {
+  'send:4290': '发送太频繁，请稍后再试',
+  '*:4290': '操作太频繁，请稍后再试',
+  'send:4035': '对方开启了好友验证，你还不是他的好友',
+  'send:4036': '消息已发出，但被对方拒收了',
+  'send:4137': '对方回复之前，最多只能发送 {N} 条消息',
+  'send:4292': '今天发起新聊天的次数已用完，请稍后再试',
+  'friendApply:4132': '你的好友数量已达上限',
+  'friendRespond:4132': '你的好友数量已达上限',
+  'friendRespond:4133': '对方好友数量已达上限',
+  'friendApply:4133': '对方好友数量已达上限',
+  'friendRespond:4045': '该申请已过期',
+  'block:4134': '黑名单已满',
+  'friendApply:4292': DAILY,
+  'userSearch:4292': DAILY,
+  'block:4292': DAILY,
+  'unblock:4292': DAILY,
+};
