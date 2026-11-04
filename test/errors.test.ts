@@ -8,10 +8,10 @@ const spec = JSON.parse(readFileSync(new URL('../protocol/errors.json', import.m
 describe('错误码（AC-SYS-01-3、AC-SYS-01-4、C-09）', () => {
   it('生成的枚举与 errors.json 完全一致', () => {
     // 只属于 console-server 的码不进终端 SDK（PRD-admin 10.1 节）。
-    const forSdk = spec.errors.filter((e) => e.scope.some((x) => x !== 'console'));
+    const forSdk = spec.errors.filter((e: { scope: string[] }) => e.scope.some((x) => x !== 'console'));
     expect(Object.keys(ErrorCode)).toHaveLength(forSdk.length);
     expect(forSdk.length).toBeLessThan(spec.errors.length);
-    for (const e of forSdk) {
+    for (const e of forSdk as Array<{ name: string; code: number; retryable: boolean }>) {
       expect((ErrorCode as Record<string, number>)[e.name]).toBe(e.code);
       expect(describeError(e.code)).toMatchObject({ name: e.name, retryable: e.retryable });
     }
