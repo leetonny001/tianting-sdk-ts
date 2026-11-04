@@ -171,6 +171,33 @@ export function tipText(tip: TipBody, me: string, nameOf: (userId: string) => st
   return '[群通知]';
 }
 
+/**
+ * 会话列表摘要的本地版本（与服务端 lastMsg.text 同一规则，PRD-social 5.5 节：只用昵称，不用"你"）。
+ * 收到提示消息时先用它，下次 convs 时被服务端文本覆盖。
+ */
+export function tipSummary(tip: TipBody, nick: (userId: string) => string): string {
+  const shown = tip.targets.slice(0, 3).map(nick).join('、');
+  const total = Math.max(tip.count ?? 0, tip.targets.length);
+  const list = total > 3 ? `${shown}等 ${total} 人` : shown;
+  const actor = tip.actor ? nick(tip.actor) : '';
+  switch (tip.kind) {
+    case 'created':
+    case 'joined':
+      return `${actor} 邀请 ${list} 加入了群聊`;
+    case 'ownerChanged':
+      return tip.targets.length ? `${list} 已成为群主` : '群主已退出群聊';
+    case 'adminSet':
+      return `${list} 已成为管理员`;
+    case 'adminUnset':
+      return `${list} 不再是管理员`;
+    case 'renamed':
+      return `${actor} 修改群名为"${tip.text}"`;
+    case 'noticeUpdated':
+      return `${actor} 更新了群公告`;
+  }
+  return '[群通知]';
+}
+
 const spaced = (actor: string, you: boolean) => (you ? '你' : `${actor} `);
 
 // ---- 界面看到的快照 ----

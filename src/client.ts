@@ -29,6 +29,7 @@ import {
   SocialState,
   type ApplySource,
   type BlockedUser,
+  tipSummary,
   type GroupInfo,
   type GroupMemberInfo,
   type Friend,
@@ -125,8 +126,8 @@ type ClientEvents = {
   friendRequests: [{ items: FriendRequest[]; unseen: number }];
   blocks: [BlockedUser[]];
   socialSettings: [SocialSettings];
-  /** 群资料或成员变了（M4）：SDK 已经用 groupInfo 更新了本地会话；打开着群设置的页面据此刷新。 */
-  groupChanged: [groupId: string];
+  /** 群资料或成员变了（M4）：SDK 已经用 groupInfo 更新了本地会话；打开着群设置的页面直接用 info，不必再查。 */
+  groupChanged: [groupId: string, info: GroupInfo];
 };
 
 /** 社交命令的选项。 */
@@ -463,8 +464,13 @@ export class IMClient extends Emitter<ClientEvents> {
     if (!this.store.applyServerMessage(m)) return;
     this.emitMessages(m.convId);
     this.emitConversations();
-    // 提示消息的 lastMsg 摘要由服务端生成（只用昵称），重新拉一次拿权威文本（F-SOC-29 规则 6）。
-    if (this.store.hasPlaceholder(m.convId) || m.type === 'tip') this.refreshConversationsSoon();
+    // 提示消息的摘要：本地按服务端同样的规则（只用昵称，F-SOC-29 规则 6）生成，下次 convs 时被权威文本覆盖。
+    // 不在这里重拉 convs：大群里一次操作会让所有在线成员同时请求。
+    if (m.type === 'tip' && m.body.tip) {
+      const nick = (u: string) => this.profileOf(u)?.nickname || u;
+      this.store.setLastMsgText(m.convId, m.msgId, tipSummary(m.body.tip, nick));
+    }
+    if (this.store.hasPlaceholder(m.convId)) this.refreshConversationsSoon();
     // 只对已经加载过的会话检测缺口：prev 为 0 说明本地还没有这个会话的消息。
     if (prev > 0 && m.seq > prev + 1) this.scheduleGapCheck(m.convId, prev, m.seq);
     if (m.convId === this.active) this.maybeReportRead();
@@ -969,13 +975,15 @@ export class IMClient extends Emitter<ClientEvents> {
       return;
     }
     this.groupInfoInFlight.set(groupId, false);
+    let info: GroupInfo | undefined;
     this.getGroupInfo(groupId)
+      .then((v) => (info = v))
       .catch((err) => this.log.warn(`im: groupInfo failed: ${String(err)}`))
       .finally(() => {
         const again = this.groupInfoInFlight.get(groupId);
         this.groupInfoInFlight.delete(groupId);
         if (again) this.onGroupChanged(groupId);
-        else this.emit('groupChanged', groupId);
+        else if (info) this.emit('groupChanged', groupId, info);
       });
   }
 

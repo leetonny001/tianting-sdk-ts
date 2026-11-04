@@ -237,6 +237,12 @@ describe('SDK × 真实服务端：群管理（FE-110、FE-111）', () => {
       'memberCount via groupChanged',
     );
 
+    // 本地生成的摘要与服务端 lastMsg.text 一致（刷新前后不跳变）。
+    const summaryOf = () => b.conversations().find((x) => x.convId === conv.convId)?.lastMsg?.text;
+    expect(summaryOf()).toBe('gm_a 邀请 gm_d 加入了群聊');
+    await b.refreshConversations();
+    expect(summaryOf()).toBe('gm_a 邀请 gm_d 加入了群聊');
+
     await a.setGroupAdmin(groupId, 'gm_b', true);
     await until(() => b.conversations().find((x) => x.convId === conv.convId)?.myRole === 'admin', 'b becomes admin');
 

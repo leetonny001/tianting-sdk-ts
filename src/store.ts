@@ -280,7 +280,7 @@ export class Store {
         msgId: m.msgId,
         from: m.from,
         type: m.type,
-        text: summary(m.body.text ?? m.body.tip?.text ?? ''),
+        text: summary(m.body.text ?? ''),
         ts: m.ts,
       };
       c.updatedAt = Math.max(c.updatedAt, m.ts);
@@ -300,6 +300,11 @@ export class Store {
   }
 
   private placeholders = new Set<string>();
+
+  setLastMsgText(convId: string, msgId: string, text: string): void {
+    const c = this.convs.get(convId);
+    if (c?.lastMsg?.msgId === msgId) c.lastMsg.text = summary(text);
+  }
 
   /** groupChanged 之后用 groupInfo 的结果更新本地会话（F-SOC-20 规则 5）。返回是否有变化。 */
   updateGroupMeta(convId: string, meta: { name: string; memberCount: number; myRole: GroupRole }): boolean {

@@ -489,10 +489,11 @@ describe('群（FE-110、FE-111）', () => {
     await expect(b).rejects.toMatchObject({ userId: 'eve' });
   });
 
-  it('tip 消息入库、计入未读、from 可以为空；lastMsg 之后用 convs 的权威文本', async () => {
+  it('tip 消息入库、计入未读、from 可以为空；摘要本地生成，不重拉 convs', async () => {
     const h = setup();
     h.im.connect('t');
     const c = await h.login('alice', [conv({ convId: G, name: 'g', maxSeq: 0 })]);
+    const n = c.frames().filter((f) => f.cmd === 'convs').length;
     c.receive({
       cmd: 'msg',
       data: {
@@ -502,15 +503,14 @@ describe('群（FE-110、FE-111）', () => {
         seq: 1,
         from: '',
         type: 'tip',
-        body: { tip: { kind: 'ownerChanged', actor: '', targets: [], text: '群主已退出群聊' } },
+        body: { tip: { kind: 'ownerChanged', actor: '', targets: [], text: '' } },
         ts: 5,
       },
     });
     expect(h.im.conversations()[0]).toMatchObject({ unread: 1, lastMsg: { type: 'tip', text: '群主已退出群聊' } });
-    const n = c.frames().filter((f) => f.cmd === 'convs').length;
     h.clock.advance(200);
     await flush();
-    expect(c.frames().filter((f) => f.cmd === 'convs')).toHaveLength(n + 1);
+    expect(c.frames().filter((f) => f.cmd === 'convs')).toHaveLength(n);
   });
 
   it('groupChanged：groupInfo 更新本地会话；在途请求合并；不重拉 convs', async () => {
