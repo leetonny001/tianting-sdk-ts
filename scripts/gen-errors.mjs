@@ -7,6 +7,8 @@ const root = fileURLToPath(new URL('../', import.meta.url));
 const out = fileURLToPath(new URL('../src/errors.gen.ts', import.meta.url));
 
 export function render(spec) {
+  // 只属于 console-server 的码不进终端 SDK（PRD-admin 10.1 节）。
+  spec = { ...spec, errors: spec.errors.filter((e) => e.scope.some((x) => x !== 'console')) };
   const lines = [
     '// 由 scripts/gen-errors.mjs 从 protocol/errors.json 生成，不要手改。',
     '',

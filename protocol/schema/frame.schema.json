@@ -32,7 +32,8 @@
       "properties": {
         "code": { "type": "integer", "description": "见 protocol/errors.json" },
         "msg": { "type": "string" },
-        "userId": { "$ref": "#/$defs/UserId", "description": "建群失败时指出是哪个人" }
+        "userId": { "$ref": "#/$defs/UserId", "description": "建群失败时指出是哪个人" },
+        "details": { "type": "object", "description": "可选的扩展信息（PRD-admin 10.2 节，第二批的 4031 用）；SDK 忽略不认识的键" }
       },
       "additionalProperties": false
     },
@@ -902,7 +903,7 @@
               "required": ["type", "reason"],
               "properties": {
                 "type": { "const": "kicked" },
-                "reason": { "enum": ["tokenInvalid", "tokenExpired", "banned", "tooManyConnections", "serverShutdown", "replaced"] }
+                "reason": { "enum": ["tokenInvalid", "tokenExpired", "banned", "suspended", "tooManyConnections", "serverShutdown", "replaced"] }
               },
               "additionalProperties": false
             },
