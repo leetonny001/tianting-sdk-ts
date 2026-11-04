@@ -1,6 +1,6 @@
 // SDK 对真实服务端的集成测试：用标准 WebSocket，验证协议、错误码和关键流程在两端一致。
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { IMClient, c2cConvId, type FatalReason, type Message } from '../../src/index.js';
+import { IMClient, c2cConvId, tipText, type FatalReason, type Message } from '../../src/index.js';
 import { startServer, type RunningServer } from './server.js';
 
 let srv: RunningServer;
@@ -196,6 +196,88 @@ describe('SDK × 真实服务端：社交（PRD-social FE-101～FE-103）', () =
     await srv.admin('DELETE', '/admin/groups/s3g1/members', { members: ['s3a'] });
     await until(() => removed.length > 0, 'convRemoved');
     expect(removed[0]).toEqual(['group:s3g1', 'removed']);
+  });
+});
+
+describe('SDK × 真实服务端：群管理（FE-110、FE-111）', () => {
+  async function befriend(a: IMClient, aId: string, b: IMClient, bId: string): Promise<void> {
+    await a.applyFriend(bId);
+    await until(() => b.friendRequests().items.some((r) => r.userId === aId), 'request arrives');
+    await b.respondFriend(aId, 'accept');
+    await until(() => a.relationOf(bId) === 'friend', 'friends');
+  }
+
+  it('建群 → 提示消息 → 邀请 → 设管理员 → 改名 → 踢人 → 转让 → 退群 → 解散', async () => {
+    await srv.admin('POST', '/admin/users/import', {
+      users: ['gm_a', 'gm_b', 'gm_c', 'gm_d'].map((userId) => ({ userId, nickname: userId })),
+    });
+    const a = await login('gm_a');
+    const b = await login('gm_b');
+    const c = await login('gm_c');
+    const d = await login('gm_d');
+    await befriend(a, 'gm_a', b, 'gm_b');
+    await befriend(a, 'gm_a', c, 'gm_c');
+    await befriend(a, 'gm_a', d, 'gm_d');
+
+    const { groupId, conv } = await a.createGroup({ members: ['gm_b', 'gm_c'] });
+    expect(conv).toMatchObject({ type: 'group', myRole: 'owner', memberCount: 3 });
+    const tipOf = (im: IMClient, kind: string) =>
+      im.messages(conv.convId).find((m) => m.type === 'tip' && m.body.tip?.kind === kind);
+    b.setActiveConversation(conv.convId);
+    await until(() => b.conversations().find((x) => x.convId === conv.convId)?.myRole === 'member', 'b sees group');
+    await b.loadHistory(conv.convId);
+    const created = await until(() => tipOf(b, 'created'), 'created tip');
+    expect(created.from).toBe('gm_a');
+    expect(tipText(created.body.tip!, 'gm_b', (u) => u)).toBe('gm_a 创建了群聊');
+
+    expect(await a.inviteToGroup(groupId, ['gm_d'])).toEqual({ added: ['gm_d'], failed: [] });
+    await until(() => tipOf(b, 'joined'), 'joined tip');
+    await until(
+      () => b.conversations().find((x) => x.convId === conv.convId)?.memberCount === 4,
+      'memberCount via groupChanged',
+    );
+
+    await a.setGroupAdmin(groupId, 'gm_b', true);
+    await until(() => b.conversations().find((x) => x.convId === conv.convId)?.myRole === 'admin', 'b becomes admin');
+
+    await b.updateGroup(groupId, { name: '周六球局', notice: '九点' });
+    await until(() => a.conversations().find((x) => x.convId === conv.convId)?.name === '周六球局', 'renamed');
+    expect(await a.getGroupInfo(groupId)).toMatchObject({
+      notice: '九点',
+      noticeBy: 'gm_b',
+      owner: 'gm_a',
+      managed: false,
+    });
+
+    // 管理员不能动群主；错误码原样透传。
+    await expect(b.kickFromGroup(groupId, ['gm_a'])).rejects.toMatchObject({ code: 4030 });
+    expect(await b.kickFromGroup(groupId, ['gm_d'])).toEqual(['gm_d']);
+    await until(() => d.conversationSnapshot(conv.convId)?.reason === 'removed', 'd removed');
+
+    const page = await a.loadGroupMembers(groupId);
+    expect(page.members.map((m) => [m.userId, m.role])).toEqual([
+      ['gm_a', 'owner'],
+      ['gm_b', 'admin'],
+      ['gm_c', 'member'],
+    ]);
+
+    await a.transferGroupOwner(groupId, 'gm_c');
+    await until(() => c.conversations().find((x) => x.convId === conv.convId)?.myRole === 'owner', 'c becomes owner');
+    await a.leaveGroup(groupId);
+    expect(a.conversations().some((x) => x.convId === conv.convId)).toBe(false);
+    expect(a.conversationSnapshot(conv.convId)?.reason).toBe('left');
+
+    await c.dissolveGroup(groupId);
+    await until(() => b.conversationSnapshot(conv.convId)?.reason === 'dissolved', 'b sees dissolved');
+  });
+
+  it('建群失败带 userId：不是好友的人返回 4035', async () => {
+    await srv.admin('POST', '/admin/users/import', {
+      users: ['gm_e', 'gm_f', 'gm_g'].map((userId) => ({ userId, nickname: userId })),
+    });
+    const e = await login('gm_e');
+    await befriend(e, 'gm_e', await login('gm_f'), 'gm_f');
+    await expect(e.createGroup({ members: ['gm_f', 'gm_g'] })).rejects.toMatchObject({ code: 4035, userId: 'gm_g' });
   });
 });
 

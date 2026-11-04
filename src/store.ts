@@ -1,4 +1,4 @@
-import type { ConvType, LastMsg, MsgBody, ServerConversation, ServerMessage } from './protocol.js';
+import type { ConvType, GroupRole, LastMsg, MsgBody, ServerConversation, ServerMessage } from './protocol.js';
 import { countCodePoints } from './text.js';
 
 /** 发送状态（PRD F-MSG-03）。queued：离线时进入待发队列；服务端来的消息都是 sent。 */
@@ -11,7 +11,7 @@ export interface Message {
   seq?: number;
   convId: string;
   from: string;
-  type: 'text' | 'custom';
+  type: 'text' | 'custom' | 'tip';
   body: MsgBody;
   /** 服务端时间；待发消息用本地时间临时展示（PRD 3.1）。 */
   ts: number;
@@ -33,6 +33,8 @@ export interface Conversation {
   updatedAt: number;
   /** 群成员数；字段缺失时为 undefined（界面只显示群名，不显示 0）。 */
   memberCount?: number;
+  /** 群里我的角色（M4）；单聊和旧服务端没有。 */
+  myRole?: GroupRole;
 }
 
 /**
@@ -274,7 +276,13 @@ export class Store {
     const c = this.convs.get(m.convId) ?? this.newConversation(m);
     if (m.seq > c.maxSeq) {
       c.maxSeq = m.seq;
-      c.lastMsg = { msgId: m.msgId, from: m.from, type: m.type, text: summary(m.body.text ?? ''), ts: m.ts };
+      c.lastMsg = {
+        msgId: m.msgId,
+        from: m.from,
+        type: m.type,
+        text: summary(m.body.text ?? m.body.tip?.text ?? ''),
+        ts: m.ts,
+      };
       c.updatedAt = Math.max(c.updatedAt, m.ts);
     }
     if (m.from === this.self()) c.readSeq = Math.max(c.readSeq, m.seq);
@@ -292,6 +300,14 @@ export class Store {
   }
 
   private placeholders = new Set<string>();
+
+  /** groupChanged 之后用 groupInfo 的结果更新本地会话（F-SOC-20 规则 5）。返回是否有变化。 */
+  updateGroupMeta(convId: string, meta: { name: string; memberCount: number; myRole: GroupRole }): boolean {
+    const c = this.convs.get(convId);
+    if (!c || (c.name === meta.name && c.memberCount === meta.memberCount && c.myRole === meta.myRole)) return false;
+    Object.assign(c, meta);
+    return true;
+  }
 
   /** 第一次收到某个会话的消息、本地还没有这个会话时，先补一个临时的；重新拉取 convs 后被服务端数据覆盖。 */
   private newConversation(m: ServerMessage): ConvState {
@@ -332,6 +348,7 @@ function sameConversation(a: Conversation, b: Conversation): boolean {
     a.unread === b.unread &&
     a.updatedAt === b.updatedAt &&
     a.memberCount === b.memberCount &&
+    a.myRole === b.myRole &&
     sameLast(a.lastMsg, b.lastMsg)
   );
 }

@@ -15,20 +15,25 @@
     },
     "Seq": { "type": "integer", "minimum": 1, "description": "会话内单调递增序号；聊天室消息没有 seq" },
     "TimestampMs": { "type": "integer", "minimum": 0 },
-    "MsgType": { "enum": ["text", "custom"] },
+    "MsgType": { "enum": ["text", "custom", "tip"], "description": "tip 由服务端生成，客户端不能发送" },
     "MsgBody": {
       "type": "object",
-      "description": "text: {text}；custom: {data}，data 为业务自定义 JSON",
+      "description": "text: {text}；custom: {data}，data 为业务自定义 JSON；tip: {tip}（只由服务端生成）",
       "properties": {
         "text": { "type": "string", "minLength": 1, "maxLength": 20000 },
-        "data": {}
+        "data": {},
+        "tip": { "$ref": "#/$defs/TipBody" }
       },
       "minProperties": 1
     },
     "Error": {
       "type": "object",
       "required": ["code", "msg"],
-      "properties": { "code": { "type": "integer", "description": "见 protocol/errors.json" }, "msg": { "type": "string" } },
+      "properties": {
+        "code": { "type": "integer", "description": "见 protocol/errors.json" },
+        "msg": { "type": "string" },
+        "userId": { "$ref": "#/$defs/UserId", "description": "建群失败时指出是哪个人" }
+      },
       "additionalProperties": false
     },
     "ClientFrame": {
@@ -52,6 +57,16 @@
         { "$ref": "#/$defs/SetPrivacyReq" },
         { "$ref": "#/$defs/UsersReq" },
         { "$ref": "#/$defs/MyGroupsReq" },
+        { "$ref": "#/$defs/GroupCreateReq" },
+        { "$ref": "#/$defs/GroupInviteReq" },
+        { "$ref": "#/$defs/GroupLeaveReq" },
+        { "$ref": "#/$defs/GroupKickReq" },
+        { "$ref": "#/$defs/GroupTransferReq" },
+        { "$ref": "#/$defs/GroupSetAdminReq" },
+        { "$ref": "#/$defs/GroupDissolveReq" },
+        { "$ref": "#/$defs/GroupUpdateReq" },
+        { "$ref": "#/$defs/GroupInfoReq" },
+        { "$ref": "#/$defs/GroupMembersReq" },
         { "$ref": "#/$defs/Ping" }
       ]
     },
@@ -387,6 +402,197 @@
       },
       "additionalProperties": false
     },
+    "GroupCreateReq": {
+      "type": "object",
+      "description": "PRD-social F-SOC-21",
+      "required": ["id", "cmd", "data"],
+      "properties": {
+        "id": { "$ref": "#/$defs/ReqId" },
+        "cmd": { "const": "groupCreate" },
+        "data": {
+          "type": "object",
+          "required": ["clientReqId", "members"],
+          "properties": {
+            "clientReqId": { "type": "string", "minLength": 8, "maxLength": 64 },
+            "name": { "type": "string" },
+            "members": { "type": "array", "items": { "type": "string" }, "minItems": 1 }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "GroupInviteReq": {
+      "type": "object",
+      "description": "F-SOC-22",
+      "required": ["id", "cmd", "data"],
+      "properties": {
+        "id": { "$ref": "#/$defs/ReqId" },
+        "cmd": { "const": "groupInvite" },
+        "data": {
+          "type": "object",
+          "required": ["groupId", "members"],
+          "properties": {
+            "groupId": { "type": "string", "minLength": 1 },
+            "members": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": 50 }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "GroupLeaveReq": {
+      "type": "object",
+      "description": "F-SOC-23",
+      "required": ["id", "cmd", "data"],
+      "properties": {
+        "id": { "$ref": "#/$defs/ReqId" },
+        "cmd": { "const": "groupLeave" },
+        "data": {
+          "type": "object",
+          "required": ["groupId"],
+          "properties": { "groupId": { "type": "string", "minLength": 1 } },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "GroupKickReq": {
+      "type": "object",
+      "description": "F-SOC-24",
+      "required": ["id", "cmd", "data"],
+      "properties": {
+        "id": { "$ref": "#/$defs/ReqId" },
+        "cmd": { "const": "groupKick" },
+        "data": {
+          "type": "object",
+          "required": ["groupId", "members"],
+          "properties": {
+            "groupId": { "type": "string", "minLength": 1 },
+            "members": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": 50 }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "GroupTransferReq": {
+      "type": "object",
+      "description": "F-SOC-25",
+      "required": ["id", "cmd", "data"],
+      "properties": {
+        "id": { "$ref": "#/$defs/ReqId" },
+        "cmd": { "const": "groupTransfer" },
+        "data": {
+          "type": "object",
+          "required": ["groupId", "to"],
+          "properties": { "groupId": { "type": "string", "minLength": 1 }, "to": { "type": "string", "minLength": 1 } },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "GroupSetAdminReq": {
+      "type": "object",
+      "description": "F-SOC-25",
+      "required": ["id", "cmd", "data"],
+      "properties": {
+        "id": { "$ref": "#/$defs/ReqId" },
+        "cmd": { "const": "groupSetAdmin" },
+        "data": {
+          "type": "object",
+          "required": ["groupId", "userId", "admin"],
+          "properties": {
+            "groupId": { "type": "string", "minLength": 1 },
+            "userId": { "type": "string", "minLength": 1 },
+            "admin": { "type": "boolean" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "GroupDissolveReq": {
+      "type": "object",
+      "description": "F-SOC-26",
+      "required": ["id", "cmd", "data"],
+      "properties": {
+        "id": { "$ref": "#/$defs/ReqId" },
+        "cmd": { "const": "groupDissolve" },
+        "data": {
+          "type": "object",
+          "required": ["groupId"],
+          "properties": { "groupId": { "type": "string", "minLength": 1 } },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "GroupUpdateReq": {
+      "type": "object",
+      "description": "F-SOC-27：name、notice 至少一项",
+      "required": ["id", "cmd", "data"],
+      "properties": {
+        "id": { "$ref": "#/$defs/ReqId" },
+        "cmd": { "const": "groupUpdate" },
+        "data": {
+          "type": "object",
+          "required": ["groupId"],
+          "properties": { "groupId": { "type": "string", "minLength": 1 }, "name": { "type": "string" }, "notice": { "type": "string" } },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "GroupInfoReq": {
+      "type": "object",
+      "description": "F-SOC-20",
+      "required": ["id", "cmd", "data"],
+      "properties": {
+        "id": { "$ref": "#/$defs/ReqId" },
+        "cmd": { "const": "groupInfo" },
+        "data": {
+          "type": "object",
+          "required": ["groupId"],
+          "properties": { "groupId": { "type": "string", "minLength": 1 } },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "GroupMembersReq": {
+      "type": "object",
+      "description": "F-SOC-28",
+      "required": ["id", "cmd", "data"],
+      "properties": {
+        "id": { "$ref": "#/$defs/ReqId" },
+        "cmd": { "const": "groupMembers" },
+        "data": {
+          "type": "object",
+          "required": ["groupId"],
+          "properties": {
+            "groupId": { "type": "string", "minLength": 1 },
+            "cursor": { "type": "string" },
+            "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 50 }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "TipBody": {
+      "type": "object",
+      "description": "群提示消息（F-SOC-29）：actor 为空表示系统操作；targets 最多 20 个，超过时带 count；不认识的 kind 显示\"[群通知]\"",
+      "required": ["kind", "actor", "targets", "text"],
+      "properties": {
+        "kind": { "type": "string", "minLength": 1 },
+        "actor": { "type": "string" },
+        "targets": { "type": "array", "items": { "$ref": "#/$defs/UserId" }, "maxItems": 20 },
+        "count": { "type": "integer", "minimum": 0 },
+        "text": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
     "Profile": {
       "description": "资料（应答时的最新值）；可能为 null（F-SOC-06 规则 9）",
       "oneOf": [
@@ -470,12 +676,14 @@
         "clientMsgId": { "type": "string", "minLength": 1 },
         "convId": { "$ref": "#/$defs/ConvId" },
         "seq": { "$ref": "#/$defs/Seq" },
-        "from": { "$ref": "#/$defs/UserId" },
+        "from": { "type": "string", "pattern": "^[A-Za-z0-9_-]{0,64}$" },
         "type": { "$ref": "#/$defs/MsgType" },
         "body": { "$ref": "#/$defs/MsgBody" },
         "ts": { "$ref": "#/$defs/TimestampMs" }
       },
-      "additionalProperties": false
+      "additionalProperties": false,
+      "if": { "properties": { "type": { "const": "tip" } } },
+      "else": { "properties": { "from": { "$ref": "#/$defs/UserId" } } }
     },
     "LastMsg": {
       "description": "会话最后一条消息的摘要；没有消息时为 null",
@@ -486,12 +694,14 @@
           "required": ["msgId", "from", "type", "text", "ts"],
           "properties": {
             "msgId": { "type": "string" },
-            "from": { "$ref": "#/$defs/UserId" },
+            "from": { "type": "string", "pattern": "^[A-Za-z0-9_-]{0,64}$" },
             "type": { "$ref": "#/$defs/MsgType" },
             "text": { "type": "string", "description": "摘要，最多 100 个码点；custom 消息为空字符串" },
             "ts": { "$ref": "#/$defs/TimestampMs" }
           },
-          "additionalProperties": false
+          "additionalProperties": false,
+          "if": { "properties": { "type": { "const": "tip" } } },
+          "else": { "properties": { "from": { "$ref": "#/$defs/UserId" } } }
         }
       ]
     },
@@ -508,7 +718,8 @@
         "unread": { "type": "integer", "minimum": 0 },
         "lastMsg": { "$ref": "#/$defs/LastMsg" },
         "updatedAt": { "$ref": "#/$defs/TimestampMs" },
-        "memberCount": { "type": "integer", "minimum": 0, "description": "群成员数（PRD-core V-07）；单聊不带。客户端遇到缺失时只显示群名" }
+        "memberCount": { "type": "integer", "minimum": 0, "description": "群成员数（PRD-core V-07）；单聊不带。客户端遇到缺失时只显示群名" },
+        "myRole": { "enum": ["owner", "admin", "member"], "description": "群里我的角色（M4）；单聊不带" }
       },
       "additionalProperties": false
     },
@@ -594,17 +805,58 @@
               "maxItems": 200,
               "items": {
                 "type": "object",
-                "required": ["groupId", "name", "memberCount", "joinedAt"],
+                "required": ["groupId", "name", "memberCount", "joinedAt", "myRole"],
                 "properties": {
                   "groupId": { "$ref": "#/$defs/UserId" },
                   "name": { "type": "string" },
                   "memberCount": { "type": "integer", "minimum": 0 },
-                  "joinedAt": { "$ref": "#/$defs/TimestampMs" }
+                  "joinedAt": { "$ref": "#/$defs/TimestampMs" },
+                  "myRole": { "enum": ["owner", "admin", "member"] }
                 },
                 "additionalProperties": false
               }
             },
-            "nextCursor": { "type": "string", "description": "空字符串表示没有更多" }
+            "nextCursor": { "type": "string", "description": "空字符串表示没有更多" },
+            "groupId": { "type": "string" },
+            "conv": { "$ref": "#/$defs/Conversation" },
+            "added": { "type": "array", "items": { "$ref": "#/$defs/UserId" } },
+            "failed": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["userId", "code"],
+                "properties": { "userId": { "$ref": "#/$defs/UserId" }, "code": { "type": "integer" } },
+                "additionalProperties": false
+              }
+            },
+            "removed": { "type": "array", "items": { "$ref": "#/$defs/UserId" } },
+            "name": { "type": "string" },
+            "notice": { "type": "string" },
+            "noticeBy": { "type": "string" },
+            "noticeAt": { "type": "integer", "minimum": 0 },
+            "owner": { "type": "string" },
+            "managed": { "type": "boolean" },
+            "myRole": { "enum": ["owner", "admin", "member"] },
+            "memberCount": { "type": "integer", "minimum": 0 },
+            "maxMembers": { "type": "integer", "minimum": 0 },
+            "historyVisible": { "type": "boolean" },
+            "createdAt": { "type": "integer", "minimum": 0 },
+            "members": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["userId", "role", "joinedAt", "nickname", "avatar", "official"],
+                "properties": {
+                  "userId": { "$ref": "#/$defs/UserId" },
+                  "role": { "enum": ["owner", "admin", "member"] },
+                  "joinedAt": { "type": "integer", "minimum": 0 },
+                  "nickname": { "type": "string" },
+                  "avatar": { "type": "string" },
+                  "official": { "type": "boolean" }
+                },
+                "additionalProperties": false
+              }
+            }
           },
           "additionalProperties": false
         },
@@ -714,6 +966,13 @@
                 "mode": { "enum": ["open", "friends"] },
                 "strangerMsgLimit": { "type": "integer", "minimum": 0 }
               },
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "description": "群资料或成员变化的提醒（M4）；同一个群至少间隔 1 秒合并发送",
+              "required": ["type", "groupId"],
+              "properties": { "type": { "const": "groupChanged" }, "groupId": { "type": "string" } },
               "additionalProperties": false
             }
           ]

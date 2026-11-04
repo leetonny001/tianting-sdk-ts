@@ -2,6 +2,8 @@
 // SocialState 是纯状态机（不做网络），与服务端的 Go 参考客户端（server/e2e/socialmodel）逐条对应，
 // 跑同一份 protocol/vectors/social.json；网络与定时由 IMClient 驱动。
 
+import type { GroupRole, TipBody } from './protocol.js';
+
 // ---- 协议类型（frame.schema.json：Profile / FriendItem / RequestItem / BlockItem） ----
 
 export interface Profile {
@@ -109,6 +111,67 @@ export interface SocialSettings {
   mode: 'open' | 'friends';
   strangerMsgLimit: number;
 }
+
+// ---- 群（M4） ----
+
+export interface GroupInfo {
+  groupId: string;
+  name: string;
+  notice: string;
+  noticeBy: string;
+  noticeAt: number;
+  /** 空字符串表示没有群主。 */
+  owner: string;
+  /** 托管群（业务方建的）。 */
+  managed: boolean;
+  myRole: GroupRole;
+  memberCount: number;
+  maxMembers: number;
+  historyVisible: boolean;
+  createdAt: number;
+}
+
+export interface GroupMemberInfo {
+  userId: string;
+  role: GroupRole;
+  joinedAt: number;
+  nickname: string;
+  avatar: string;
+  official: boolean;
+}
+
+/**
+ * 提示消息的本地文案（PRD-ui F-UI-40，用例 protocol/vectors/social.json 的 tips）：
+ * actor / targets 是自己时用"你"，其他人用 nameOf（可以是本机备注）。不认识的 kind 显示"[群通知]"。
+ */
+export function tipText(tip: TipBody, me: string, nameOf: (userId: string) => string): string {
+  const who = (u: string) => (u === me ? '你' : nameOf(u));
+  const shown = tip.targets.slice(0, 3).map(who).join('、');
+  const total = Math.max(tip.count ?? 0, tip.targets.length);
+  const targets = total > 3 ? `${shown} 等 ${total} 人` : shown;
+  const actor = who(tip.actor);
+  const you = tip.actor === me;
+  switch (tip.kind) {
+    case 'created':
+      return `${spaced(actor, you)}创建了群聊`;
+    case 'joined':
+      return you ? `你邀请 ${targets} 加入了群聊` : `${actor} 邀请 ${targets} 加入了群聊`;
+    case 'ownerChanged':
+      if (tip.actor) return `${spaced(actor, you)}将群主转让给 ${targets}`;
+      return tip.targets.length ? `${targets} 已成为群主` : '群主已退出群聊';
+    case 'adminSet':
+      return `${spaced(actor, you)}将 ${targets} 设为管理员`;
+    case 'adminUnset':
+      return `${spaced(actor, you)}取消了 ${targets} 的管理员`;
+    case 'renamed':
+      return `${spaced(actor, you)}修改群名为"${tip.text}"`;
+    case 'noticeUpdated':
+      return `${spaced(actor, you)}更新了群公告`;
+  }
+  return '[群通知]';
+}
+
+const spaced = (actor: string, you: boolean) => (you ? '你' : `${actor} `);
 
 // ---- 界面看到的快照 ----
 

@@ -12,6 +12,7 @@ import { Emitter } from './emitter.js';
 import { ErrorCode, IMError } from './errors.js';
 import { silentLogger, type Logger } from './logger.js';
 import {
+  groupConvId,
   parseConvId,
   type AuthAck,
   type ConvsAck,
@@ -28,6 +29,8 @@ import {
   SocialState,
   type ApplySource,
   type BlockedUser,
+  type GroupInfo,
+  type GroupMemberInfo,
   type Friend,
   type FriendRequest,
   type MyGroup,
@@ -122,6 +125,8 @@ type ClientEvents = {
   friendRequests: [{ items: FriendRequest[]; unseen: number }];
   blocks: [BlockedUser[]];
   socialSettings: [SocialSettings];
+  /** 群资料或成员变了（M4）：SDK 已经用 groupInfo 更新了本地会话；打开着群设置的页面据此刷新。 */
+  groupChanged: [groupId: string];
 };
 
 /** 社交命令的选项。 */
@@ -437,6 +442,9 @@ export class IMClient extends Emitter<ClientEvents> {
       case 'readUpdated':
         if (this.store.advanceRead(ev.convId, ev.readSeq)) this.emitConversations();
         return;
+      case 'groupChanged':
+        this.onGroupChanged(ev.groupId);
+        return;
       case 'socialChanged':
         this.social.onSocialChanged(ev.ver);
         if (this.social.needSync) this.syncSocialSoon();
@@ -455,7 +463,8 @@ export class IMClient extends Emitter<ClientEvents> {
     if (!this.store.applyServerMessage(m)) return;
     this.emitMessages(m.convId);
     this.emitConversations();
-    if (this.store.hasPlaceholder(m.convId)) this.refreshConversationsSoon();
+    // 提示消息的 lastMsg 摘要由服务端生成（只用昵称），重新拉一次拿权威文本（F-SOC-29 规则 6）。
+    if (this.store.hasPlaceholder(m.convId) || m.type === 'tip') this.refreshConversationsSoon();
     // 只对已经加载过的会话检测缺口：prev 为 0 说明本地还没有这个会话的消息。
     if (prev > 0 && m.seq > prev + 1) this.scheduleGapCheck(m.convId, prev, m.seq);
     if (m.convId === this.active) this.maybeReportRead();
@@ -871,6 +880,106 @@ export class IMClient extends Emitter<ClientEvents> {
       cursor = ack.nextCursor;
     }
   }
+
+  // ---- 群（PRD-social FE-110、FE-111） ----
+
+  /** 建群：自动生成 clientReqId，超时重试用同一个（不会重复建群，F-SOC-21 规则 1）。 */
+  async createGroup(opts: { name?: string; members: string[] }): Promise<{ groupId: string; conv: Conversation }> {
+    const clientReqId = this.newId();
+    const data = { clientReqId, members: opts.members, ...(opts.name ? { name: opts.name } : {}) };
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const ack = await this.conn.request<{ groupId: string; conv: ServerConversation }>('groupCreate', data);
+        this.store.upsertConversation(ack.conv);
+        this.emitConversations();
+        const conv = this.store.conversation(ack.conv.convId)!;
+        return { groupId: ack.groupId, conv };
+      } catch (err) {
+        if (!(err instanceof TimeoutError) || attempt >= 2) throw err;
+      }
+    }
+  }
+
+  async inviteToGroup(
+    groupId: string,
+    members: string[],
+  ): Promise<{ added: string[]; failed: Array<{ userId: string; code: number }> }> {
+    return this.conn.request('groupInvite', { groupId, members });
+  }
+
+  /** 退群：本连接不会收到 convRemoved，本地直接按 left 处理。 */
+  async leaveGroup(groupId: string): Promise<void> {
+    await this.conn.request('groupLeave', { groupId });
+    this.removeLocally(groupId, 'left');
+  }
+
+  async kickFromGroup(groupId: string, members: string[]): Promise<string[]> {
+    return (await this.conn.request<{ removed: string[] }>('groupKick', { groupId, members })).removed;
+  }
+
+  async transferGroupOwner(groupId: string, to: string): Promise<void> {
+    await this.conn.request('groupTransfer', { groupId, to });
+    this.onGroupChanged(groupId);
+  }
+
+  async setGroupAdmin(groupId: string, userId: string, admin: boolean): Promise<void> {
+    await this.conn.request('groupSetAdmin', { groupId, userId, admin });
+  }
+
+  async dissolveGroup(groupId: string): Promise<void> {
+    await this.conn.request('groupDissolve', { groupId });
+    this.removeLocally(groupId, 'dissolved');
+  }
+
+  async updateGroup(groupId: string, patch: { name?: string; notice?: string }): Promise<void> {
+    await this.conn.request('groupUpdate', { groupId, ...patch });
+  }
+
+  /** 群资料；同时更新本地会话的 myRole、memberCount、name。 */
+  async getGroupInfo(groupId: string): Promise<GroupInfo> {
+    const info = await this.conn.request<GroupInfo>('groupInfo', { groupId });
+    if (this.store.updateGroupMeta(groupConvId(groupId), info)) this.emitConversations();
+    return info;
+  }
+
+  /** 一页群成员（群主 → 管理员 → 成员）；资料写进缓存。 */
+  async loadGroupMembers(
+    groupId: string,
+    cursor?: string,
+  ): Promise<{ members: GroupMemberInfo[]; nextCursor: string }> {
+    const ack = await this.conn.request<{ members: GroupMemberInfo[]; nextCursor: string }>('groupMembers', {
+      groupId,
+      ...(cursor ? { cursor } : {}),
+    });
+    for (const m of ack.members) this.profiles.put(m);
+    return ack;
+  }
+
+  private removeLocally(groupId: string, reason: string): void {
+    const convId = groupConvId(groupId);
+    this.store.removeConversation(convId, reason);
+    this.emitConversations();
+    this.emit('convRemoved', convId, reason);
+  }
+
+  /** groupChanged：刷新这个群的资料，不重拉 convs；同一个群的在途请求合并（F-SOC-20 规则 5）。 */
+  private onGroupChanged(groupId: string): void {
+    if (this.groupInfoInFlight.has(groupId)) {
+      this.groupInfoInFlight.set(groupId, true);
+      return;
+    }
+    this.groupInfoInFlight.set(groupId, false);
+    this.getGroupInfo(groupId)
+      .catch((err) => this.log.warn(`im: groupInfo failed: ${String(err)}`))
+      .finally(() => {
+        const again = this.groupInfoInFlight.get(groupId);
+        this.groupInfoInFlight.delete(groupId);
+        if (again) this.onGroupChanged(groupId);
+        else this.emit('groupChanged', groupId);
+      });
+  }
+
+  private groupInfoInFlight = new Map<string, boolean>();
 
   private async socialCmd(cmd: string, data: Record<string, unknown>): Promise<SocialChangeAck> {
     const ack = await this.conn.request<SocialChangeAck>(cmd, data);

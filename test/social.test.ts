@@ -1,6 +1,14 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { ErrorCode, IMError, SocialState, messageFor, type SocialSyncAck } from '../src/index.js';
+import {
+  ErrorCode,
+  IMError,
+  SocialState,
+  messageFor,
+  tipText,
+  type SocialSyncAck,
+  type TipBody,
+} from '../src/index.js';
 import { ProfileCache, type FriendItem, type RequestItem, type SocialItems } from '../src/social.js';
 import { conv, flush, setup } from './helpers.js';
 
@@ -26,6 +34,7 @@ const spec = JSON.parse(readFileSync(new URL('../protocol/vectors/social.json', 
     };
   }>;
   copy: Array<{ cmd: string; code: number; text: string }>;
+  tips: Array<{ me: string; names?: Record<string, string>; tip: TipBody; text: string }>;
 };
 
 describe('关系同步：与其他 SDK 共用 protocol/vectors/social.json（PRD-social 10.3 节，FE-101）', () => {
@@ -62,9 +71,17 @@ describe('关系同步：与其他 SDK 共用 protocol/vectors/social.json（PRD
     });
   }
 
+  it('提示消息文案（F-UI-40）', () => {
+    for (const c of spec.tips) {
+      expect(tipText(c.tip, c.me, (u) => c.names?.[u] ?? u)).toBe(c.text);
+    }
+  });
+
   it('"命令 + 错误码"文案（9.4 节）', () => {
     for (const x of spec.copy)
-      expect(messageFor(x.cmd, x.code, { strangerMsgLimit: 3 }), `${x.cmd} ${x.code}`).toBe(x.text.replace('{N}', '3'));
+      expect(messageFor(x.cmd, x.code, { strangerMsgLimit: 3, name: 'bob' }), `${x.cmd} ${x.code}`).toBe(
+        x.text.replace('{N}', '3').replace('{name}', 'bob'),
+      );
     expect(messageFor('send', ErrorCode.QUOTA_EXCEEDED)).toBe('今天发起新聊天的次数已用完，请稍后再试');
     expect(messageFor('setPrivacy', 4290)).toBe('操作太频繁，请稍后再试');
     expect(messageFor('send', 4042)).toBeUndefined();
@@ -435,5 +452,121 @@ describe('性能（FE-101 第 7 条，AC-SOC-06-14 的 SDK 部分）', () => {
     s.beginRound();
     s.applyPage(big);
     expect(performance.now() - t0).toBeLessThan(50);
+  });
+});
+
+describe('群（FE-110、FE-111）', () => {
+  const G = 'group:g1';
+
+  it('createGroup：超时重试用同一个 clientReqId；ack 的 conv 进入会话列表', async () => {
+    const { h, c } = await loggedIn();
+    c.ack('socialSync', page({ untilVer: 0 }));
+    await flush();
+    const p = h.im.createGroup({ members: ['bob', 'carol'] });
+    const first = c.last('groupCreate').data.clientReqId;
+    h.clock.advance(10_001);
+    await flush();
+    const sent = c.frames().filter((f) => f.cmd === 'groupCreate');
+    expect(sent).toHaveLength(2);
+    expect(sent[1]?.data?.clientReqId).toBe(first);
+    c.ack('groupCreate', { groupId: 'g1', conv: conv({ convId: G, name: 'x', memberCount: 3, myRole: 'owner' }) });
+    const r = await p;
+    expect(r.conv).toMatchObject({ convId: G, myRole: 'owner', memberCount: 3 });
+    expect(h.im.conversations().map((x) => x.convId)).toContain(G);
+  });
+
+  it('错误带 userId（兼容 details.userId）', async () => {
+    const { h, c } = await loggedIn();
+    const a = h.im.createGroup({ members: ['bob', 'dave'] });
+    c.receive({ id: c.last('groupCreate').id, cmd: 'ack', error: { code: 4035, msg: 'x', userId: 'dave' } });
+    await expect(a).rejects.toMatchObject({ code: 4035, userId: 'dave' });
+    const b = h.im.createGroup({ members: ['bob', 'eve'] });
+    c.receive({
+      id: c.last('groupCreate').id,
+      cmd: 'ack',
+      error: { code: 4035, msg: 'x', details: { userId: 'eve' } },
+    });
+    await expect(b).rejects.toMatchObject({ userId: 'eve' });
+  });
+
+  it('tip 消息入库、计入未读、from 可以为空；lastMsg 之后用 convs 的权威文本', async () => {
+    const h = setup();
+    h.im.connect('t');
+    const c = await h.login('alice', [conv({ convId: G, name: 'g', maxSeq: 0 })]);
+    c.receive({
+      cmd: 'msg',
+      data: {
+        msgId: 'm1',
+        clientMsgId: 'tip-1',
+        convId: G,
+        seq: 1,
+        from: '',
+        type: 'tip',
+        body: { tip: { kind: 'ownerChanged', actor: '', targets: [], text: '群主已退出群聊' } },
+        ts: 5,
+      },
+    });
+    expect(h.im.conversations()[0]).toMatchObject({ unread: 1, lastMsg: { type: 'tip', text: '群主已退出群聊' } });
+    const n = c.frames().filter((f) => f.cmd === 'convs').length;
+    h.clock.advance(200);
+    await flush();
+    expect(c.frames().filter((f) => f.cmd === 'convs')).toHaveLength(n + 1);
+  });
+
+  it('groupChanged：groupInfo 更新本地会话；在途请求合并；不重拉 convs', async () => {
+    const h = setup();
+    h.im.connect('t');
+    const c = await h.login('alice', [conv({ convId: G, name: 'g', memberCount: 3, myRole: 'member' })]);
+    const seen: string[] = [];
+    h.im.on('groupChanged', (g) => seen.push(g));
+    const convs = c.frames().filter((f) => f.cmd === 'convs').length;
+    c.receive({ cmd: 'event', data: { type: 'groupChanged', groupId: 'g1' } });
+    c.receive({ cmd: 'event', data: { type: 'groupChanged', groupId: 'g1' } });
+    c.receive({ cmd: 'event', data: { type: 'groupChanged', groupId: 'g1' } });
+    expect(c.frames().filter((f) => f.cmd === 'groupInfo')).toHaveLength(1);
+    const info = {
+      groupId: 'g1',
+      name: '新名',
+      memberCount: 5,
+      myRole: 'admin',
+      notice: '',
+      noticeBy: '',
+      noticeAt: 0,
+      owner: 'bob',
+      managed: false,
+      maxMembers: 500,
+      historyVisible: false,
+      createdAt: 1,
+    };
+    c.ack('groupInfo', info);
+    await flush();
+    expect(c.frames().filter((f) => f.cmd === 'groupInfo')).toHaveLength(2); // 期间又有变化：再查一次
+    c.ack('groupInfo', { ...info, memberCount: 6 });
+    await flush();
+    expect(h.im.conversations()[0]).toMatchObject({ name: '新名', memberCount: 6, myRole: 'admin' });
+    expect(seen).toEqual(['g1']);
+    expect(c.frames().filter((f) => f.cmd === 'convs')).toHaveLength(convs);
+  });
+
+  it('退群：本地按 left 移除并保留快照；解散按 dissolved', async () => {
+    const h = setup();
+    h.im.connect('t');
+    const c = await h.login('alice', [conv({ convId: G, name: 'g' })]);
+    const p = h.im.leaveGroup('g1');
+    c.ack('groupLeave', {});
+    await p;
+    expect(h.im.conversations()).toEqual([]);
+    expect(h.im.conversationSnapshot(G)).toMatchObject({ reason: 'left', name: 'g' });
+  });
+
+  it('loadGroupMembers 的资料覆盖缓存', async () => {
+    const { h, c } = await loggedIn();
+    const p = h.im.loadGroupMembers('g1');
+    c.ack('groupMembers', {
+      members: [{ userId: 'bob', role: 'owner', joinedAt: 1, nickname: '阿博', avatar: '', official: false }],
+      nextCursor: '',
+    });
+    await p;
+    expect(h.im.profileOf('bob')?.nickname).toBe('阿博');
   });
 });

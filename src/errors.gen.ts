@@ -77,7 +77,7 @@ export const ERROR_INFO: Readonly<Record<number, { name: string; retryable: bool
   4046: { name: "TARGET_NOT_GROUP_MEMBER", retryable: false, message: "操作对象不是群成员" },
   4090: { name: "GROUP_EXISTS", retryable: false, message: "群 ID 已存在" },
   4091: { name: "FRIEND_REQUEST_HANDLED", retryable: false, message: "申请已同意" },
-  4130: { name: "GROUP_MEMBER_LIMIT_EXCEEDED", retryable: false, message: "群成员超过 2000 人" },
+  4130: { name: "GROUP_MEMBER_LIMIT_EXCEEDED", retryable: false, message: "群成员已达上限" },
   4131: { name: "BATCH_LIMIT_EXCEEDED", retryable: false, message: "单次批量操作数量超限" },
   4132: { name: "FRIEND_LIMIT_EXCEEDED", retryable: false, message: "好友数量已达上限" },
   4133: { name: "PEER_FRIEND_LIMIT_EXCEEDED", retryable: false, message: "对方好友数量已达上限" },

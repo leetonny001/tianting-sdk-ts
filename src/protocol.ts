@@ -3,10 +3,22 @@
 export type ConvType = 'c2c' | 'group' | 'room';
 export type Platform = 'android' | 'ios' | 'web' | 'pc';
 
+/** 群提示消息（PRD-social F-SOC-29）：actor 为空表示系统操作；targets 最多 20 个，超过时带 count。 */
+export interface TipBody {
+  kind: string;
+  actor: string;
+  targets: string[];
+  count?: number;
+  text: string;
+}
+
 export interface MsgBody {
   text?: string;
   data?: unknown;
+  tip?: TipBody;
 }
+
+export type GroupRole = 'owner' | 'admin' | 'member';
 
 /** 服务端的一条消息（msg 帧、sync 结果）。 */
 export interface ServerMessage {
@@ -15,7 +27,7 @@ export interface ServerMessage {
   convId: string;
   seq: number;
   from: string;
-  type: 'text' | 'custom';
+  type: 'text' | 'custom' | 'tip';
   body: MsgBody;
   ts: number;
 }
@@ -41,6 +53,8 @@ export interface ServerConversation {
   updatedAt: number;
   /** 群成员数（PRD-core V-07）；单聊没有，旧服务端也可能没有。 */
   memberCount?: number;
+  /** 群里我的角色（M4）；单聊没有。 */
+  myRole?: GroupRole;
 }
 
 export interface SendAck {
@@ -70,6 +84,7 @@ export type ServerEvent =
   | { type: 'convAdded'; conv: ServerConversation }
   | { type: 'convRemoved'; convId: string; reason?: string }
   | { type: 'readUpdated'; convId: string; readSeq: number }
+  | { type: 'groupChanged'; groupId: string }
   | { type: 'socialChanged'; ver: number }
   | { type: 'socialSettingsChanged'; mode: 'open' | 'friends'; strangerMsgLimit: number };
 
@@ -78,7 +93,7 @@ export interface InboundFrame {
   id?: string;
   cmd: string;
   data?: unknown;
-  error?: { code: number; msg: string };
+  error?: { code: number; msg: string; userId?: string; details?: { userId?: string } };
 }
 
 /** 单聊会话 ID：c2c:{较小 userId}:{较大 userId}，按 ASCII 字节序比较（与服务端一致）。 */

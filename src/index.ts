@@ -9,6 +9,9 @@ export {
 export {
   REQUEST_RETENTION_MS,
   SocialState,
+  tipText,
+  type GroupInfo,
+  type GroupMemberInfo,
   type ApplySource,
   type BlockItem,
   type BlockedUser,
@@ -46,6 +49,8 @@ export {
   parseConvIdStrict,
   peerId,
   type ConvType,
+  type GroupRole,
+  type TipBody,
   type Platform,
 } from './protocol.js';
 export type { Clock } from './clock.js';

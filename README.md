@@ -23,6 +23,13 @@ im.relationOf(userId);                                 // self > blocked > frien
 await im.searchUser(keyword); await im.setSearchable(bool);
 await im.getUsers(userIds);                            // 资料缓存 10 分钟，同一事件循环内合并、每批 100
 await im.loadMyGroups();
+
+// 群管理（M4）：错误里的 err.userId 指出是哪个人导致失败
+const { groupId } = await im.createGroup({ members: ['bob', 'carol'] });
+await im.inviteToGroup(groupId, ['dave']); // { added, failed: [{ userId, code }] }
+await im.getGroupInfo(groupId); // kickFromGroup / setGroupAdmin / transferGroupOwner / updateGroup / leaveGroup / dissolveGroup
+im.on('groupChanged', (id) => refreshGroupPage(id)); // 本地会话的 name、memberCount、myRole 已更新
+// type === 'tip' 的消息用 tipText(msg.body.tip, me, nameOf) 生成本地文案
 messageFor(cmd, code, { strangerMsgLimit });           // "命令 + 错误码"文案
 ```
 

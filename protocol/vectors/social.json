@@ -1,5 +1,5 @@
 {
-  "description": "关系同步共享用例（PRD-social 10.3 节）：按顺序执行 steps（begin = 开始一轮；page = 一页 socialSync 应答；event = socialChanged {ver}；ack = 自己发起的修改的 ack），然后按 nowMs（服务端时间）断言 expect。expect.requests 的键为 userId/direction，值为按服务端时间算出的状态；needSync 表示是否要立即（再）开始一轮。copy 是\"命令 + 错误码\"文案（{N} 取 strangerMsgLimit）。期望结果由服务端的 Go 参考客户端（server/e2e/socialmodel）生成。",
+  "description": "关系同步共享用例（PRD-social 10.3 节）：按顺序执行 steps（begin = 开始一轮；page = 一页 socialSync 应答；event = socialChanged {ver}；ack = 自己发起的修改的 ack），然后按 nowMs（服务端时间）断言 expect。expect.requests 的键为 userId/direction，值为按服务端时间算出的状态；needSync 表示是否要立即（再）开始一轮。copy 是\"命令 + 错误码\"文案（{N} 取 strangerMsgLimit，{name} 取对方显示名）；tips 是群提示消息的本地文案（PRD-ui F-UI-40）。期望结果由服务端的 Go 参考客户端（server/e2e/socialmodel）生成。",
   "cases": [
     {
       "name": "同一个 ver 跨页",
@@ -1094,6 +1094,265 @@
       "cmd": "unblock",
       "code": 4292,
       "text": "今天的次数已用完，明天再试"
+    },
+    {
+      "cmd": "groupCreate",
+      "code": 4035,
+      "text": "{name} 不是你的好友，无法邀请"
+    },
+    {
+      "cmd": "groupInvite",
+      "code": 4035,
+      "text": "{name} 不是你的好友，无法邀请"
+    },
+    {
+      "cmd": "groupCreate",
+      "code": 4135,
+      "text": "{name} 加入的群聊已达上限"
+    },
+    {
+      "cmd": "groupInvite",
+      "code": 4135,
+      "text": "{name} 加入的群聊已达上限"
+    },
+    {
+      "cmd": "groupCreate",
+      "code": 4030,
+      "text": "当前不允许创建群聊"
+    },
+    {
+      "cmd": "groupCreate",
+      "code": 4292,
+      "text": "今天的次数已用完，明天再试"
+    },
+    {
+      "cmd": "groupTransfer",
+      "code": 4046,
+      "text": "对方已不在群里"
+    },
+    {
+      "cmd": "groupSetAdmin",
+      "code": 4046,
+      "text": "对方已不在群里"
+    },
+    {
+      "cmd": "groupSetAdmin",
+      "code": 4136,
+      "text": "管理员最多 10 人"
+    }
+  ],
+  "tips": [
+    {
+      "me": "alice",
+      "tip": {
+        "kind": "created",
+        "actor": "alice",
+        "targets": [
+          "bob"
+        ],
+        "text": ""
+      },
+      "text": "你创建了群聊"
+    },
+    {
+      "me": "bob",
+      "tip": {
+        "kind": "created",
+        "actor": "alice",
+        "targets": [
+          "bob"
+        ],
+        "text": ""
+      },
+      "text": "alice 创建了群聊"
+    },
+    {
+      "me": "alice",
+      "tip": {
+        "kind": "joined",
+        "actor": "bob",
+        "targets": [
+          "carol",
+          "dave"
+        ],
+        "text": ""
+      },
+      "text": "bob 邀请 carol、dave 加入了群聊"
+    },
+    {
+      "me": "alice",
+      "names": {
+        "carol": "卡姐"
+      },
+      "tip": {
+        "kind": "joined",
+        "actor": "bob",
+        "targets": [
+          "carol",
+          "dave"
+        ],
+        "text": ""
+      },
+      "text": "bob 邀请 卡姐、dave 加入了群聊"
+    },
+    {
+      "me": "bob",
+      "tip": {
+        "kind": "joined",
+        "actor": "bob",
+        "targets": [
+          "dave"
+        ],
+        "text": ""
+      },
+      "text": "你邀请 dave 加入了群聊"
+    },
+    {
+      "me": "dave",
+      "tip": {
+        "kind": "joined",
+        "actor": "bob",
+        "targets": [
+          "dave"
+        ],
+        "text": ""
+      },
+      "text": "bob 邀请 你 加入了群聊"
+    },
+    {
+      "me": "alice",
+      "tip": {
+        "kind": "joined",
+        "actor": "bob",
+        "targets": [
+          "ua",
+          "ub",
+          "uc",
+          "ud",
+          "ue",
+          "uf",
+          "ug",
+          "uh",
+          "ui",
+          "uj",
+          "uk",
+          "ul",
+          "um",
+          "un",
+          "uo",
+          "up",
+          "uq",
+          "ur",
+          "us",
+          "ut"
+        ],
+        "count": 35,
+        "text": ""
+      },
+      "text": "bob 邀请 ua、ub、uc 等 35 人 加入了群聊"
+    },
+    {
+      "me": "alice",
+      "tip": {
+        "kind": "joined",
+        "actor": "bob",
+        "targets": [
+          "a",
+          "b",
+          "c",
+          "d"
+        ],
+        "text": ""
+      },
+      "text": "bob 邀请 a、b、c 等 4 人 加入了群聊"
+    },
+    {
+      "me": "x",
+      "tip": {
+        "kind": "ownerChanged",
+        "actor": "alice",
+        "targets": [
+          "bob"
+        ],
+        "text": ""
+      },
+      "text": "alice 将群主转让给 bob"
+    },
+    {
+      "me": "x",
+      "tip": {
+        "kind": "ownerChanged",
+        "actor": "",
+        "targets": [
+          "bob"
+        ],
+        "text": ""
+      },
+      "text": "bob 已成为群主"
+    },
+    {
+      "me": "x",
+      "tip": {
+        "kind": "ownerChanged",
+        "actor": "",
+        "targets": [],
+        "text": ""
+      },
+      "text": "群主已退出群聊"
+    },
+    {
+      "me": "x",
+      "tip": {
+        "kind": "adminSet",
+        "actor": "alice",
+        "targets": [
+          "bob"
+        ],
+        "text": ""
+      },
+      "text": "alice 将 bob 设为管理员"
+    },
+    {
+      "me": "x",
+      "tip": {
+        "kind": "adminUnset",
+        "actor": "alice",
+        "targets": [
+          "bob"
+        ],
+        "text": ""
+      },
+      "text": "alice 取消了 bob 的管理员"
+    },
+    {
+      "me": "x",
+      "tip": {
+        "kind": "renamed",
+        "actor": "alice",
+        "targets": [],
+        "text": "周六球局"
+      },
+      "text": "alice 修改群名为\"周六球局\""
+    },
+    {
+      "me": "x",
+      "tip": {
+        "kind": "noticeUpdated",
+        "actor": "alice",
+        "targets": [],
+        "text": "周六 9 点"
+      },
+      "text": "alice 更新了群公告"
+    },
+    {
+      "me": "x",
+      "tip": {
+        "kind": "futureKind",
+        "actor": "alice",
+        "targets": [],
+        "text": ""
+      },
+      "text": "[群通知]"
     }
   ]
 }
