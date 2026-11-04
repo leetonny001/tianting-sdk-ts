@@ -212,6 +212,23 @@ describe('社交同步引擎（FE-101）', () => {
     await expect(p).rejects.toBeInstanceOf(IMError);
   });
 
+  it('全量轮被限流（4290）：6 秒后重试，首轮最终能结束', async () => {
+    const { h, c } = await loggedIn();
+    c.ackError('socialSync', ErrorCode.RATE_LIMITED);
+    await flush();
+    expect(h.im.socialLoaded()).toBe(false);
+    const n = c.frames().filter((f) => f.cmd === 'socialSync').length;
+    h.clock.advance(5_999);
+    await flush();
+    expect(c.frames().filter((f) => f.cmd === 'socialSync')).toHaveLength(n);
+    h.clock.advance(1);
+    await flush();
+    expect(c.frames().filter((f) => f.cmd === 'socialSync')).toHaveLength(n + 1);
+    c.ack('socialSync', page({ untilVer: 1 }));
+    await flush();
+    expect(h.im.socialLoaded()).toBe(true);
+  });
+
   it('被踢时清空社交状态', async () => {
     const { h, c } = await loggedIn();
     c.ack('socialSync', page({ untilVer: 1, friends: [friend('bob', 1)] }));
@@ -336,6 +353,20 @@ describe('资料缓存、批量查资料、我的群聊（FE-103）', () => {
     await h.im.getUsers(['u0']);
     expect(c.frames().filter((f) => f.cmd === 'users')).toHaveLength(sent);
     // 10 分钟过期见下一个用例（推进假时钟 10 分钟会触发心跳超时、断开连接）。
+  });
+
+  it('users 没有返回的人 10 分钟内不重查；之后同步里拿到资料立即可见', async () => {
+    const { h, c } = await loggedIn();
+    const a = h.im.getUsers(['ghost']);
+    await flush();
+    c.ack('users', { users: [] });
+    expect(await a).toEqual([]);
+    const sent = c.frames().filter((f) => f.cmd === 'users').length;
+    expect(await h.im.getUsers(['ghost'])).toEqual([]);
+    expect(c.frames().filter((f) => f.cmd === 'users')).toHaveLength(sent);
+    c.ack('socialSync', page({ untilVer: 1, friends: [friend('ghost', 1)] }));
+    await flush();
+    expect((await h.im.getUsers(['ghost']))[0]?.nickname).toBe('GHOST');
   });
 
   it('资料缓存 10 分钟有效；过期后 last 仍可用于显示', () => {

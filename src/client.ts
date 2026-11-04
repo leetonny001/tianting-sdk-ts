@@ -9,7 +9,7 @@ import {
   type FatalReason,
 } from './connection.js';
 import { Emitter } from './emitter.js';
-import { IMError } from './errors.js';
+import { ErrorCode, IMError } from './errors.js';
 import { silentLogger, type Logger } from './logger.js';
 import {
   parseConvId,
@@ -135,6 +135,7 @@ export interface ApplyFriendOptions {
 }
 
 const SOCIAL_DEBOUNCE_MS = 200; // socialChanged 去抖（F-SOC-06 规则 6）
+const SOCIAL_RETRY_MS = 6_000; // socialFull 限流每 6 秒恢复一轮
 const SOCIAL_PAGE = 500;
 const USERS_BATCH = 100;
 
@@ -740,6 +741,12 @@ export class IMClient extends Emitter<ClientEvents> {
     return this.social.official;
   }
 
+  /** 立即从本地 socialVer 同步一轮（例如 friendRespond 返回 4045 之后刷新状态，同时按服务端时间重算过期）。 */
+  refreshSocial(): Promise<void> {
+    this.social.needSync = true;
+    return this.syncSocial();
+  }
+
   /** 只看本地的关系（与 userSearch 的 relation 同一枚举）。 */
   relationOf(userId: string): Relation {
     return this.social.relationOf(userId, this.self, this.serverNow());
@@ -817,7 +824,7 @@ export class IMClient extends Emitter<ClientEvents> {
    */
   async getUsers(userIds: string[]): Promise<UserProfile[]> {
     const ids = [...new Set(userIds)];
-    const missing = ids.filter((id) => !this.profiles.fresh(id));
+    const missing = ids.filter((id) => this.profiles.needsFetch(id));
     if (missing.length) {
       const first = this.usersQueue.size === 0;
       const done = new Promise<void>((resolve) => {
@@ -842,6 +849,7 @@ export class IMClient extends Emitter<ClientEvents> {
       try {
         const ack = await this.conn.request<{ users: UserProfile[] }>('users', { userIds: batch });
         for (const u of ack.users) this.profiles.put(u);
+        for (const id of batch) if (!this.profiles.fresh(id)) this.profiles.markMissing(id);
       } catch (err) {
         this.log.warn(`im: users failed: ${String(err)}`);
       }
@@ -912,7 +920,18 @@ export class IMClient extends Emitter<ClientEvents> {
         } catch (err) {
           this.social.abortRound();
           this.log.warn(`im: socialSync failed: ${String(err)}`);
-          break; // 下一次事件或重连时再同步
+          // 全量轮被限流（每分钟 10 轮，例如频繁刷新页面）：稍后重试，否则首轮同步一直结束不了。
+          // 其他失败等下一次事件或重连。
+          if (err instanceof IMError && err.code === ErrorCode.RATE_LIMITED) {
+            this.social.needSync = true;
+            if (this.socialTimer === null) {
+              this.socialTimer = this.clock.setTimeout(() => {
+                this.socialTimer = null;
+                void this.syncSocial();
+              }, SOCIAL_RETRY_MS);
+            }
+          }
+          break;
         }
         this.emitSocial();
       }

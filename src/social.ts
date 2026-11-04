@@ -303,11 +303,25 @@ export class SocialState {
 export class ProfileCache {
   static readonly TTL_MS = 10 * 60 * 1000;
   private entries = new Map<string, { p: UserProfile; at: number }>();
+  /** users 没有返回的人（不可见或不存在）：有效期内不重查，避免每次渲染都发请求、耗尽限流。 */
+  private misses = new Map<string, number>();
 
   constructor(private readonly now: () => number) {}
 
   put(p: UserProfile): void {
     this.entries.set(p.userId, { p, at: this.now() });
+    this.misses.delete(p.userId);
+  }
+
+  markMissing(userId: string): void {
+    this.misses.set(userId, this.now());
+  }
+
+  /** 这个 userId 还需要向服务端查询吗（既没有有效资料，也不是最近查过没有的）。 */
+  needsFetch(userId: string): boolean {
+    if (this.fresh(userId)) return false;
+    const at = this.misses.get(userId);
+    return at === undefined || this.now() - at >= ProfileCache.TTL_MS;
   }
 
   putProfile(userId: string, p: Profile | null): void {
@@ -327,5 +341,6 @@ export class ProfileCache {
 
   clear(): void {
     this.entries.clear();
+    this.misses.clear();
   }
 }
