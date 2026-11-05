@@ -40,11 +40,14 @@ export class IMError extends Error {
   readonly code: number;
   /** 建群失败时是哪个人（error.userId，兼容 details.userId，PRD-core D-1 未定）。 */
   readonly userId?: string;
-  constructor(code: number, message: string, userId?: string) {
+  /** error.details 原样透传，例如 4031 的 {scope, groupId?, mutedUntil}。 */
+  readonly details?: Readonly<Record<string, unknown>>;
+  constructor(code: number, message: string, userId?: string, details?: Readonly<Record<string, unknown>>) {
     super(`${code} ${message}`);
     this.name = 'IMError';
     this.code = code;
     this.userId = userId;
+    this.details = details;
   }
   get description(): ErrorDescription {
     return describeError(this.code);

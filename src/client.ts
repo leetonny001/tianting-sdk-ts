@@ -11,6 +11,7 @@ import {
 import { Emitter } from './emitter.js';
 import { ErrorCode, IMError } from './errors.js';
 import { silentLogger, type Logger } from './logger.js';
+import { MuteTable, type MuteInfo } from './mute.js';
 import {
   groupConvId,
   parseConvId,
@@ -94,6 +95,8 @@ const MAX_CATCH_UP = 200;
 const PAGE = 200;
 const LATEST_PAGE = 20;
 const REFRESH_THROTTLE_MS = 30_000; // refreshConversations 的节流（G-UI-24）
+// 禁言最长 30 天，超过 setTimeout 的上限（约 24.8 天，超出会立即触发）：分段等，到点再算一次。
+const MUTE_TIMER_MAX_MS = 86_400_000;
 
 type ClientEvents = {
   /** 连接状态。 */
@@ -117,6 +120,8 @@ type ClientEvents = {
    * reason 透传服务端的值（removed / dissolved / left / 不认识的值）；推断出来的没有 reason。
    */
   convRemoved: [convId: string, reason?: string];
+  /** 禁言状态变了（muted / unmuted、auth ack、convs、发送返回 4031、到期）：用 muteState(convId) 读当前状态。 */
+  muteChanged: [];
   /** 被踢或收到不应重连的关闭码，连接已停止，需要回到登录页（C-01）。 */
   fatal: [FatalReason];
   // ---- 社交（PRD-social 10.1 节）：每次本地社交状态变化时四个一起发出（快照引用在没有变化时保持不变） ----
@@ -185,6 +190,9 @@ export class IMClient extends Emitter<ClientEvents> {
     settings: SocialSettings;
   };
   private usersQueue = new Map<string, Array<() => void>>();
+  private mutes = new MuteTable();
+  private muteKey = this.mutes.key();
+  private muteTimer: TimerHandle | null = null;
 
   constructor(o: IMClientOptions) {
     super();
@@ -276,6 +284,21 @@ export class IMClient extends Emitter<ClientEvents> {
     return { ok: true, message: msg };
   }
 
+  /**
+   * 这个会话当前的禁言（PRD-admin F-ADM-40、41）：没有被禁言时为 null。
+   * 按服务端时间判断到期；用户级优先，群内禁言只影响该群。
+   */
+  muteState(convId: string): MuteInfo | null {
+    return this.mutes.get(convId, this.serverNow());
+  }
+
+  /**
+   * 调试接口（AC-ADM-31-3）：导出内存里的会话和全部消息副本（含发送队列），是一份拷贝。不包含 token。
+   */
+  debugExport(): { conversations: unknown[]; messages: Record<string, Message[]> } {
+    return JSON.parse(JSON.stringify(this.store.debugExport())) as ReturnType<IMClient['debugExport']>;
+  }
+
   /** 手动重发失败的消息，沿用原来的 clientMsgId（PRD F-MSG-03 规则 2）。 */
   retry(convId: string, clientMsgId: string): void {
     const m = this.store.list(convId).local(clientMsgId);
@@ -338,11 +361,13 @@ export class IMClient extends Emitter<ClientEvents> {
   /** 页面可见性变化时调用（开启 browserEvents 时自动调用）。 */
   visibilityChanged(): void {
     this.maybeReportRead();
+    this.expireMutes(); // 休眠后定时器可能晚到
   }
 
   /** 网络恢复时调用（开启 browserEvents 时自动调用）：立即重连，不等退避。 */
   networkOnline(): void {
     this.conn.reconnectNow();
+    this.expireMutes();
   }
 
   // ---- 连接事件 ----
@@ -372,6 +397,8 @@ export class IMClient extends Emitter<ClientEvents> {
     if (this.self && this.self !== a.userId) this.reset(); // 换了账号
     this.self = a.userId;
     this.serverOffset = a.serverTime - this.clock.now();
+    this.mutes.setUser(a.mutedUntil); // 没有这个字段表示没有用户级禁言（离线期间可能已经解除）
+    this.mutesChanged();
     this.flushQueued();
     try {
       const ack = await this.conn.request<ConvsAck>('convs', {});
@@ -384,6 +411,25 @@ export class IMClient extends Emitter<ClientEvents> {
     // 先 convs，再从本地 socialVer 开始一轮关系同步（F-SOC-06 规则 10）。
     this.social.needSync = true;
     void this.syncSocial();
+    void this.recheckDeleted();
+  }
+
+  /**
+   * 重连后重新拉一遍已加载的范围：断开期间被删除的消息不会再发 msgDeleted，只有 sync 才能拿到（F-ADM-31 规则 5），
+   * 不拉的话内存里的原文会一直留着。首次连接没有已加载的消息，不发请求。
+   */
+  private async recheckDeleted(): Promise<void> {
+    for (const { convId, from, to } of this.store.loadedRanges()) {
+      try {
+        if (await this.syncAfter(convId, from - 1, to)) {
+          this.emitMessages(convId);
+          this.emitConversations();
+        }
+      } catch (err) {
+        this.log.warn(`im: recheck deleted failed: ${String(err)}`);
+        return;
+      }
+    }
   }
 
   /**
@@ -412,13 +458,14 @@ export class IMClient extends Emitter<ClientEvents> {
     this.emitConversations();
   }
 
-  /** 从 after 开始补拉，直到拿到 until 或者没有更多。 */
-  private async syncAfter(convId: string, after: number, until: number): Promise<void> {
+  /** 从 after 开始补拉，直到拿到 until 或者没有更多。返回本地消息是否有变化。 */
+  private async syncAfter(convId: string, after: number, until: number): Promise<boolean> {
+    let changed = false;
     for (;;) {
       const ack = await this.conn.request<SyncAck>('sync', { convId, afterSeq: after, limit: PAGE });
-      for (const m of ack.messages) this.store.applyServerMessage(m);
+      for (const m of ack.messages) if (this.store.applyServerMessage(m)) changed = true;
       const last = ack.messages.at(-1)?.seq ?? after;
-      if (!ack.hasMore || last >= until || last <= after) return;
+      if (!ack.hasMore || last >= until || last <= after) return changed;
       after = last;
     }
   }
@@ -433,10 +480,14 @@ export class IMClient extends Emitter<ClientEvents> {
     switch (ev.type) {
       case 'convAdded':
         this.store.upsertConversation(ev.conv);
+        this.setGroupMute(ev.conv.convId, ev.conv.mutedUntil);
+        this.mutesChanged();
         this.emitConversations();
         return;
       case 'convRemoved':
         this.store.removeConversation(ev.convId, ev.reason);
+        this.setGroupMute(ev.convId, undefined); // 被移出时清除该群的禁言（F-ADM-41 规则 4）
+        this.mutesChanged();
         this.emitConversations();
         this.emit('convRemoved', ev.convId, ev.reason);
         return;
@@ -445,6 +496,15 @@ export class IMClient extends Emitter<ClientEvents> {
         return;
       case 'groupChanged':
         this.onGroupChanged(ev.groupId);
+        return;
+      case 'msgDeleted':
+        this.onMsgDeleted(ev.convId, ev.msgIds ?? [], ev.seqs ?? []);
+        return;
+      case 'muted':
+        this.applyMute(ev.scope, ev.groupId, ev.mutedUntil ?? null);
+        return;
+      case 'unmuted':
+        this.applyMute(ev.scope, ev.groupId, undefined);
         return;
       case 'socialChanged':
         this.social.onSocialChanged(ev.ver);
@@ -458,6 +518,69 @@ export class IMClient extends Emitter<ClientEvents> {
     }
   }
 
+  /**
+   * 消息被删除（PRD-admin F-ADM-31）：清除内存里的原文，摘要改成占位，未读不变。
+   * 还有没拿到 ack 的本地消息时（超时标记失败、ack 丢了），被删的可能正是其中一条：事件里只有 msgId 和 seq，
+   * 要向服务端补拉才能按 clientMsgId 对上，并清掉发送队列里的那份原文。
+   */
+  private onMsgDeleted(convId: string, msgIds: string[], seqs: number[]): void {
+    const changed = this.store.deleteMessages(convId, msgIds, seqs);
+    if (changed) this.emitMessages(convId);
+    this.emitConversations();
+    const list = this.store.list(convId);
+    const top = Math.max(0, ...seqs);
+    const local = this.store.maxSeq(convId);
+    if (!list.hasUnsent || top <= local) return;
+    this.syncAfter(convId, local || top - 1, top)
+      .then(() => {
+        this.emitMessages(convId);
+        this.emitConversations();
+      })
+      .catch((err) => this.log.warn(`im: deleted sync failed: ${String(err)}`));
+  }
+
+  /** 更新禁言表；不认识的 scope 忽略（协议 README 第 3 节规则 9）。until 为 undefined 表示解除。 */
+  private applyMute(scope: unknown, groupId: unknown, until: number | null | undefined): void {
+    if (scope === 'user') this.mutes.setUser(until);
+    else if (scope === 'group' && typeof groupId === 'string') this.mutes.setGroup(groupId, until);
+    else return;
+    this.mutesChanged();
+  }
+
+  /** 发送返回 4031：按 details 更新状态，界面显示禁用条。这条消息只标记失败，不自动重发。 */
+  private onMutedAck(details: Readonly<Record<string, unknown>> | undefined): void {
+    if (!details) return;
+    const until = details.mutedUntil;
+    if (until === null || typeof until === 'number') this.applyMute(details.scope, details.groupId, until);
+  }
+
+  private setGroupMute(convId: string, until: number | null | undefined): void {
+    if (convId.startsWith('group:')) this.mutes.setGroup(convId.slice('group:'.length), until);
+  }
+
+  /** 表有变化时发事件，并按最早的到期时间重新定时。 */
+  private mutesChanged(): void {
+    if (this.muteTimer !== null) this.clock.clearTimeout(this.muteTimer);
+    this.muteTimer = null;
+    const key = this.mutes.key();
+    if (key !== this.muteKey) {
+      this.muteKey = key;
+      this.emit('muteChanged');
+    }
+    const next = this.mutes.nextExpiry();
+    if (next === null) return;
+    const wait = Math.min(Math.max(0, next - this.serverNow()), MUTE_TIMER_MAX_MS);
+    this.muteTimer = this.clock.setTimeout(() => {
+      this.muteTimer = null;
+      this.expireMutes();
+    }, wait);
+  }
+
+  private expireMutes(): void {
+    this.mutes.purge(this.serverNow());
+    this.mutesChanged();
+  }
+
   /** 实时消息：合并、检测缺口（F-MSG-04 规则 2）、必要时上报已读。 */
   private onMessage(m: ServerMessage): void {
     const prev = this.store.maxSeq(m.convId);
@@ -466,7 +589,7 @@ export class IMClient extends Emitter<ClientEvents> {
     this.emitConversations();
     // 提示消息的摘要：本地按服务端同样的规则（只用昵称，F-SOC-29 规则 6）生成，下次 convs 时被权威文本覆盖。
     // 不在这里重拉 convs：大群里一次操作会让所有在线成员同时请求。
-    if (m.type === 'tip' && m.body.tip) {
+    if (m.type === 'tip' && m.body?.tip) {
       const nick = (u: string) => this.profileOf(u)?.nickname || u;
       this.store.setLastMsgText(m.convId, m.msgId, tipSummary(m.body.tip, nick));
     }
@@ -497,6 +620,13 @@ export class IMClient extends Emitter<ClientEvents> {
   private applyConvs(ack: ConvsAck): void {
     const gone = this.store.setConversations(ack.convs, ack.truncated);
     this.lastRefreshAt = this.clock.now();
+    for (const c of ack.convs) {
+      this.setGroupMute(c.convId, c.mutedUntil);
+      // 错过了 msgDeleted 的话，摘要是唯一的线索：本地已加载的那条也要清掉。
+      if (c.lastMsg?.deleted && this.store.deleteMessages(c.convId, [c.lastMsg.msgId], [])) this.emitMessages(c.convId);
+    }
+    for (const id of gone) this.setGroupMute(id, undefined);
+    this.mutesChanged();
     this.emitConversations();
     for (const id of gone) this.emit('convRemoved', id);
   }
@@ -571,15 +701,17 @@ export class IMClient extends Emitter<ClientEvents> {
     if (!m) return;
     this.emitMessages(convId);
     const { convType, to } = parseConvId(convId, this.self);
+    const type = m.type;
     const onAck = (ack: SendAck) => {
+      // 正文在 ack 到的时候再取：等待期间消息可能已经被删除，回调不能留着一份原文。
       this.store.applyServerMessage({
         msgId: ack.msgId,
         clientMsgId,
         convId: ack.convId,
         seq: ack.seq,
         from: this.self,
-        type: m.type,
-        body: m.body,
+        type,
+        body: list.local(clientMsgId)?.body,
         ts: ack.ts,
       });
       this.emitMessages(convId);
@@ -595,12 +727,14 @@ export class IMClient extends Emitter<ClientEvents> {
           // 超时后 ack 才到：以 ack 为准，变为已发送（C-30）。
           onLateAck: (data, err) => {
             if (!err) onAck(data as SendAck);
+            else if (err.code === ErrorCode.MUTED) this.onMutedAck(err.details);
           },
         },
       )
       .then(onAck)
       .catch((err: unknown) => {
         // 失败回调是异步的：这期间消息可能已经被别的路径改过状态（例如被踢时标记为失败），只处理仍在发送中的。
+        if (err instanceof IMError && err.code === ErrorCode.MUTED) this.onMutedAck(err.details);
         if (list.local(clientMsgId)?.status !== 'sending') return;
         if (err instanceof IMError) this.fail(convId, clientMsgId, err.code);
         else if (err instanceof TimeoutError) this.fail(convId, clientMsgId, 'timeout');
@@ -714,6 +848,8 @@ export class IMClient extends Emitter<ClientEvents> {
     if (this.readTimer !== null) this.clock.clearTimeout(this.readTimer);
     this.readTimer = null;
     this.store = new Store(() => this.self);
+    this.mutes.clear();
+    this.mutesChanged();
     this.clearSocial();
     this.knownLists.clear();
     this.autoUsed.clear();
@@ -897,6 +1033,8 @@ export class IMClient extends Emitter<ClientEvents> {
       try {
         const ack = await this.conn.request<{ groupId: string; conv: ServerConversation }>('groupCreate', data);
         this.store.upsertConversation(ack.conv);
+        this.setGroupMute(ack.conv.convId, ack.conv.mutedUntil);
+        this.mutesChanged();
         this.emitConversations();
         const conv = this.store.conversation(ack.conv.convId)!;
         return { groupId: ack.groupId, conv };
@@ -964,6 +1102,8 @@ export class IMClient extends Emitter<ClientEvents> {
   private removeLocally(groupId: string, reason: string): void {
     const convId = groupConvId(groupId);
     this.store.removeConversation(convId, reason);
+    this.setGroupMute(convId, undefined);
+    this.mutesChanged();
     this.emitConversations();
     this.emit('convRemoved', convId, reason);
   }

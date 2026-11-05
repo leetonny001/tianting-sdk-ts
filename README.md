@@ -36,6 +36,19 @@ messageFor(cmd, code, { strangerMsgLimit });           // "命令 + 错误码"�
 快照读取：`friends()`、`friendRequests()`、`blocks()`、`socialSettings()`、`socialLoaded()`、`profileOf(userId)`、`displayName(userId)`。
 同步规则（PRD-social 10.2 节）由纯状态机 `SocialState` 实现，跑共享用例 `protocol/vectors/social.json`（与服务端的 Go 参考客户端同一份）。失败的命令抛出 `IMError`（`code` 透传）。
 
+## 封禁、消息删除、禁言（PRD-admin 第二批）
+
+```ts
+im.on('fatal', (r) => …);        // 封禁：{ kind: 'kicked', reason: 'suspended', code: 4012, until }，until 永久为 null；不重连
+im.on('messages', (id, list) => …); // 被删的消息 deleted = true、body = {}，seq 不变；原文从内存清除
+// 会话摘要：lastMsg.deleted = true 时没有 text；未读不变
+im.muteState(convId);            // null，或 { scope: 'user' | 'group', groupId?, mutedUntil }（永久为 null）
+im.on('muteChanged', () => …);   // muted / unmuted、auth ack、convs、发送返回 4031、到期（按服务端时间）
+im.debugExport();                // 调试：内存里的会话和全部消息副本（拷贝，不含 token）
+```
+
+重连后 SDK 会重新拉一遍已加载的 seq 范围：断开期间被删除的消息不会再发 `msgDeleted`，只有 `sync` 能拿到。
+
 ## 开发
 
 需要 Node 22.12+。

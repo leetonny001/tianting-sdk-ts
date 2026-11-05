@@ -18,6 +18,9 @@ export interface Message {
   status: MessageStatus;
   /** 发送失败的原因：错误码，或 "timeout" / "kicked"。 */
   error?: number | 'timeout' | 'kicked';
+  /** 被删除（PRD-admin F-ADM-31）：seq、msgId、发送者、时间都保留，body 为空对象。 */
+  deleted?: boolean;
+  deletedAt?: number;
 }
 
 /** 界面看到的一个会话。 */
@@ -56,6 +59,11 @@ interface ConvState extends Conversation {
 
 const SUMMARY_LEN = 100;
 
+/** 被删除的最后一条消息的摘要：不保留原文。 */
+function deletedLast(m: { msgId: string; from: string; type: string; ts: number }): LastMsg {
+  return { msgId: m.msgId, from: m.from, type: m.type, ts: m.ts, deleted: true };
+}
+
 function summary(text: string): string {
   if (countCodePoints(text) <= SUMMARY_LEN) return text;
   return Array.from(text).slice(0, SUMMARY_LEN).join('');
@@ -67,24 +75,72 @@ class MessageList {
   private unsent: Message[] = [];
   private byClient = new Map<string, Message>();
   private byMsgId = new Set<string>();
+  // 已知被删除的 msgId / seq：之后才到的 sync 结果、发送 ack 带着原文也不能写回来。
+  private deletedIds = new Set<string>();
+  private deletedSeqs = new Set<number>();
   /** 已加载的最早 seq（用于向前翻页）；0 表示还没加载过。 */
   oldestSeq = 0;
   /** 向前翻页是否还有更早的消息。 */
   hasMoreHistory = true;
 
-  /** 合并服务端消息；按 msgId 去重，按 clientMsgId 合并本地待发消息。返回是否有变化。 */
-  addServer(m: ServerMessage): boolean {
-    if (this.byMsgId.has(m.msgId)) return false;
+  /**
+   * 合并服务端消息；按 msgId 去重，按 clientMsgId 合并本地待发消息。
+   * 已有的消息只会变成已删除。返回合并后的消息，没有变化时为 null。
+   */
+  addServer(m: ServerMessage): Message | null {
+    const deleted = m.deleted === true || this.isDeleted(m.msgId, m.seq);
+    if (this.byMsgId.has(m.msgId)) {
+      const old = this.bySeq.get(m.seq);
+      return deleted && old && !old.deleted ? this.wipe(old, m.deletedAt) : null;
+    }
     const local = this.byClient.get(m.clientMsgId);
     if (local && local.seq === undefined && local.from === m.from) {
       this.unsent = this.unsent.filter((x) => x !== local);
     }
-    const msg: Message = { ...m, status: 'sent' };
+    const msg: Message = deleted
+      ? { ...m, body: {}, deleted: true, status: 'sent' }
+      : { ...m, body: m.body ?? {}, status: 'sent' };
     this.bySeq.set(m.seq, msg);
     this.byClient.set(m.clientMsgId, msg);
     this.byMsgId.add(m.msgId);
     if (this.oldestSeq === 0 || m.seq < this.oldestSeq) this.oldestSeq = m.seq;
-    return true;
+    return msg;
+  }
+
+  isDeleted(msgId: string, seq?: number): boolean {
+    return this.deletedIds.has(msgId) || (seq !== undefined && this.deletedSeqs.has(seq));
+  }
+
+  /** 记下被删除的消息并清掉已加载的原文。返回是否有消息变了。 */
+  markDeleted(msgIds: readonly string[], seqs: readonly number[]): boolean {
+    for (const id of msgIds) this.deletedIds.add(id);
+    for (const s of seqs) this.deletedSeqs.add(s);
+    let changed = false;
+    for (const m of [...this.bySeq.values()]) {
+      if (!m.deleted && this.isDeleted(m.msgId ?? '', m.seq)) {
+        this.wipe(m);
+        changed = true;
+      }
+    }
+    return changed;
+  }
+
+  private wipe(old: Message, deletedAt?: number): Message {
+    const next: Message = { ...old, body: {}, deleted: true };
+    if (deletedAt !== undefined) next.deletedAt = deletedAt;
+    this.bySeq.set(old.seq!, next);
+    this.byClient.set(old.clientMsgId, next);
+    return next;
+  }
+
+  /** 是否有还没有 seq 的本地消息（待发 / 失败），它们可能正是服务端已经存下的某一条。 */
+  get hasUnsent(): boolean {
+    return this.unsent.length > 0;
+  }
+
+  /** 调试导出：这个会话内存里的全部消息副本（AC-ADM-31-3）。 */
+  debugAll(): Message[] {
+    return [...new Set([...this.bySeq.values(), ...this.unsent, ...this.byClient.values()])];
   }
 
   addLocal(m: Message): void {
@@ -230,7 +286,11 @@ export class Store {
   private lastList: Conversation[] | null = null;
 
   private fromServer(c: ServerConversation): ConvState {
-    return { ...c, readBase: c.maxSeq - c.unread };
+    const { mutedUntil: _, ...rest } = c; // 禁言状态由 IMClient 的 MuteTable 维护，事件和到期都会改它
+    const last = c.lastMsg;
+    // 这份 convs 可能是删除之前生成的：已知被删除的消息不能把原文带回摘要。
+    const stale = last && !last.deleted && this.msgs.get(c.convId)?.isDeleted(last.msgId);
+    return { ...rest, lastMsg: stale ? deletedLast(last) : last, readBase: c.maxSeq - c.unread };
   }
 
   /** 已读位置前进（自己上报、其他端同步、发言即已读），只进不退。 */
@@ -270,24 +330,51 @@ export class Store {
    * 自己发的消息（来自自己的其他端）不增加未读，并推进已读（C-34）。返回是否是新消息。
    */
   applyServerMessage(m: ServerMessage): boolean {
-    const added = this.list(m.convId).addServer(m);
+    const merged = this.list(m.convId).addServer(m);
     this.bumpMax(m.convId, m.seq);
-    if (!added) return false;
+    if (!merged) return false;
     const c = this.convs.get(m.convId) ?? this.newConversation(m);
     if (m.seq > c.maxSeq) {
       c.maxSeq = m.seq;
-      c.lastMsg = {
-        msgId: m.msgId,
-        from: m.from,
-        type: m.type,
-        text: summary(m.body.text ?? ''),
-        ts: m.ts,
-      };
+      c.lastMsg = merged.deleted
+        ? deletedLast(m)
+        : { msgId: m.msgId, from: m.from, type: m.type, text: summary(merged.body.text ?? ''), ts: m.ts };
       c.updatedAt = Math.max(c.updatedAt, m.ts);
+    } else if (merged.deleted && c.lastMsg?.msgId === m.msgId) {
+      c.lastMsg = deletedLast(c.lastMsg);
     }
     if (m.from === this.self()) c.readSeq = Math.max(c.readSeq, m.seq);
     this.recount(c);
     return true;
+  }
+
+  /**
+   * 消息被删除（msgDeleted，或 convs 的 lastMsg.deleted）：清除原文，摘要改成占位。seq 不留空洞，未读不变（C-02）。
+   * 没加载过的消息也记下来，之后到的 sync 结果、发送 ack 不会把原文写回来。返回消息列表是否有变化。
+   */
+  deleteMessages(convId: string, msgIds: readonly string[], seqs: readonly number[]): boolean {
+    const changed = this.list(convId).markDeleted(msgIds, seqs);
+    const c = this.convs.get(convId);
+    if (c?.lastMsg && !c.lastMsg.deleted && (msgIds.includes(c.lastMsg.msgId) || seqs.includes(c.maxSeq))) {
+      c.lastMsg = deletedLast(c.lastMsg);
+    }
+    return changed;
+  }
+
+  /** 已加载过服务端消息的会话和已加载的 seq 范围。 */
+  loadedRanges(): Array<{ convId: string; from: number; to: number }> {
+    const out: Array<{ convId: string; from: number; to: number }> = [];
+    for (const [convId, l] of this.msgs) {
+      if (l.oldestSeq > 0) out.push({ convId, from: l.oldestSeq, to: l.maxLoadedSeq });
+    }
+    return out;
+  }
+
+  /** 调试导出：内存里的会话和全部消息副本（AC-ADM-31-3）。 */
+  debugExport(): { conversations: unknown[]; messages: Record<string, Message[]> } {
+    const messages: Record<string, Message[]> = {};
+    for (const [convId, l] of this.msgs) messages[convId] = l.debugAll();
+    return { conversations: [...this.convs.values(), ...this.snapshots.values()], messages };
   }
 
   bumpMax(convId: string, seq: number): void {
@@ -303,7 +390,7 @@ export class Store {
 
   setLastMsgText(convId: string, msgId: string, text: string): void {
     const c = this.convs.get(convId);
-    if (c?.lastMsg?.msgId === msgId) c.lastMsg.text = summary(text);
+    if (c?.lastMsg?.msgId === msgId && !c.lastMsg.deleted) c.lastMsg.text = summary(text);
   }
 
   /** groupChanged 之后用 groupInfo 的结果更新本地会话（F-SOC-20 规则 5）。返回是否有变化。 */
@@ -338,7 +425,14 @@ export class Store {
 function sameLast(a: LastMsg | null, b: LastMsg | null): boolean {
   if (a === b) return true;
   return (
-    !!a && !!b && a.msgId === b.msgId && a.ts === b.ts && a.text === b.text && a.from === b.from && a.type === b.type
+    !!a &&
+    !!b &&
+    a.msgId === b.msgId &&
+    a.ts === b.ts &&
+    a.text === b.text &&
+    a.from === b.from &&
+    a.type === b.type &&
+    a.deleted === b.deleted
   );
 }
 

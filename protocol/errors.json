@@ -29,7 +29,7 @@
     { "code": 4036, "name": "REJECTED_BY_PEER",            "http": null, "scope": ["ws"], "retryable": false, "message": "消息被对方拒收", "action": "send：消息标记失败，提示「消息已发出，但被对方拒收了」，不自动重发" },
     { "code": 4037, "name": "CSRF_INVALID", "http": 403, "scope": ["console"], "retryable": false, "message": "CSRF 令牌缺失或错误，或 Origin 不匹配", "action": "重新取会话信息后重放一次，仍失败提示刷新" },
     { "code": 4038, "name": "STEP_UP_REQUIRED", "http": 403, "scope": ["console"], "retryable": false, "message": "该操作需要重新验证", "action": "弹 TOTP 框，通过后自动重放" },
-    { "code": 4039, "name": "MSG_READ_GRANT_REQUIRED", "http": 403, "scope": ["console"], "retryable": false, "message": "没有该会话有效的正文 / 隔离原文查看授权", "action": "弹「工单号 + 理由 + 动态码」框" },
+    { "code": 4039, "name": "MSG_READ_GRANT_REQUIRED", "http": 403, "scope": ["admin", "console"], "retryable": false, "message": "没有该会话有效的正文 / 隔离原文查看授权", "action": "弹「工单号 + 理由 + 动态码」框" },
     { "code": 4040, "name": "NOT_FOUND",                   "http": 404, "scope": ["ws", "admin", "console"], "retryable": false, "message": "资源不存在",           "action": "提示「内容不存在」" },
     { "code": 4041, "name": "NOT_IN_ROOM",                 "http": null, "scope": ["ws"],          "retryable": false, "message": "未加入该聊天室",       "action": "二期：重新进房" },
     { "code": 4042, "name": "USER_NOT_FOUND",              "http": 404, "scope": ["ws", "admin"], "retryable": false, "message": "用户不存在",           "action": "提示「用户不存在」" },

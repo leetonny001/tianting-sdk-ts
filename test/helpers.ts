@@ -19,7 +19,7 @@ export interface Harness {
 }
 
 export function setup(opts: Partial<IMClientOptions> = {}): Harness {
-  const clock = new FakeClock();
+  const clock = (opts.clock as FakeClock | undefined) ?? new FakeClock();
   const transport = new FakeTransport();
   const logs: string[] = [];
   const logger: Logger = {
@@ -32,13 +32,13 @@ export function setup(opts: Partial<IMClientOptions> = {}): Harness {
   const im = new IMClient({
     url: 'ws://im.test/ws',
     transport,
-    clock,
     random: () => 0.5, // 抖动为 0，退避间隔精确
     newId: () => `cid-${String(++n).padStart(4, '0')}`,
     logger,
     isVisible: () => visible.value,
     browserEvents: false,
     ...opts,
+    clock,
   });
   const h: Harness = {
     im,

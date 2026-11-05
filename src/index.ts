@@ -31,6 +31,7 @@ export {
 export type { ConnState, FatalReason } from './connection.js';
 export { ConnectionClosedError, NotConnectedError, TimeoutError } from './connection.js';
 export type { Conversation, ConversationSnapshot, Message, MessageStatus } from './store.js';
+export type { MuteInfo } from './mute.js';
 export { avatarColorIndex, avatarInitial, fnv1a32 } from './avatar.js';
 export {
   CloseCode,

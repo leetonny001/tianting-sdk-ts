@@ -9,7 +9,9 @@ export type ConnState = 'disconnected' | 'connecting' | 'connected';
 
 /** 连接不再自动重连的原因：被踢（kicked 事件），或者收到不应重连的关闭码（1000、4009～4012、4429）。 */
 export type FatalReason =
-  { kind: 'kicked'; reason: string; code: number } | { kind: 'closed'; code: number; reason: string };
+  /** until 只在 reason = suspended 时有：封禁到期时间（毫秒），永久为 null。 */
+  | { kind: 'kicked'; reason: string; code: number; until?: number | null }
+  | { kind: 'closed'; code: number; reason: string };
 
 export interface ConnectionOptions {
   /** WebSocket 地址，例如 wss://im.example.com/ws（不要带 token，C-52）。 */
@@ -100,6 +102,7 @@ export class Connection extends Emitter<ConnEvents> {
   private heartbeatTimer: TimerHandle | null = null;
   private pongTimer: TimerHandle | null = null;
   private kickedReason: string | null = null;
+  private kickedUntil: number | null | undefined;
   private reqN = 0;
   private authId = '';
   private pending = new Map<string, Pending>();
@@ -173,6 +176,7 @@ export class Connection extends Emitter<ConnEvents> {
   private dial(): void {
     const gen = ++this.connGen;
     this.kickedReason = null;
+    this.kickedUntil = undefined;
     this.setState('connecting');
     const url = `${this.o.url}?platform=${encodeURIComponent(this.o.platform)}`;
     this.conn = this.o.transport.open(url, {
@@ -207,10 +211,11 @@ export class Connection extends Emitter<ConnEvents> {
         this.clearPong();
         return;
       case 'event': {
-        const ev = f.data as { type?: string; reason?: string } | undefined;
+        const ev = f.data as { type?: string; reason?: string; until?: number | null } | undefined;
         if (ev?.type === 'kicked') {
           // 先记下原因，等随后的关闭码到达时统一处理。
           this.kickedReason = ev.reason ?? '';
+          this.kickedUntil = ev.until;
           return;
         }
         this.emit('frame', f);
@@ -237,7 +242,9 @@ export class Connection extends Emitter<ConnEvents> {
     if (!p || !f.id) return;
     this.pending.delete(f.id);
     this.o.clock.clearTimeout(p.timer);
-    const err = f.error ? new IMError(f.error.code, f.error.msg, f.error.userId ?? f.error.details?.userId) : undefined;
+    const err = f.error
+      ? new IMError(f.error.code, f.error.msg, f.error.userId ?? f.error.details?.userId, f.error.details)
+      : undefined;
     if (p.timedOut) {
       p.onLateAck?.(f.data, err);
       return;
@@ -272,7 +279,8 @@ export class Connection extends Emitter<ConnEvents> {
     // 被踢不重连（PRD F-AUTH-03 规则 4），例外：服务端下线按退避重连（C-55）。
     if (kicked !== null && kicked !== 'serverShutdown') {
       this.active = false;
-      this.emit('fatal', { kind: 'kicked', reason: kicked, code });
+      const until = this.kickedUntil;
+      this.emit('fatal', { kind: 'kicked', reason: kicked, code, ...(until !== undefined ? { until } : {}) });
       return;
     }
     // 1000、4009～4012、4429 不重连；未列出的关闭码（1006 等）按可以重连处理。

@@ -28,16 +28,21 @@ export interface ServerMessage {
   seq: number;
   from: string;
   type: 'text' | 'custom' | 'tip';
-  body: MsgBody;
+  /** 被删除的消息没有 body（PRD-core F-MSG-05 规则 7）。 */
+  body?: MsgBody;
   ts: number;
+  deleted?: boolean;
+  deletedAt?: number;
 }
 
 export interface LastMsg {
   msgId: string;
   from: string;
   type: string;
-  text: string;
+  /** 最后一条消息被删除时没有 text（deleted = true）。 */
+  text?: string;
   ts: number;
+  deleted?: boolean;
 }
 
 /** convs 的一项、convAdded 的内容。 */
@@ -55,6 +60,8 @@ export interface ServerConversation {
   memberCount?: number;
   /** 群里我的角色（M4）；单聊没有。 */
   myRole?: GroupRole;
+  /** 我在该群被禁言时才有，永久为 null（第二批）。 */
+  mutedUntil?: number | null;
 }
 
 export interface SendAck {
@@ -77,10 +84,15 @@ export interface ConvsAck {
 export interface AuthAck {
   userId: string;
   serverTime: number;
+  /** 用户级禁言时才有，永久为 null（第二批）。 */
+  mutedUntil?: number | null;
 }
 
 export type ServerEvent =
-  | { type: 'kicked'; reason: string }
+  | { type: 'kicked'; reason: string; until?: number | null }
+  | { type: 'msgDeleted'; convId: string; msgIds: string[]; seqs: number[] }
+  | { type: 'muted'; scope: string; groupId?: string; mutedUntil: number | null }
+  | { type: 'unmuted'; scope: string; groupId?: string }
   | { type: 'convAdded'; conv: ServerConversation }
   | { type: 'convRemoved'; convId: string; reason?: string }
   | { type: 'readUpdated'; convId: string; readSeq: number }
@@ -93,7 +105,7 @@ export interface InboundFrame {
   id?: string;
   cmd: string;
   data?: unknown;
-  error?: { code: number; msg: string; userId?: string; details?: { userId?: string } };
+  error?: { code: number; msg: string; userId?: string; details?: { userId?: string } & Record<string, unknown> };
 }
 
 /** 单聊会话 ID：c2c:{较小 userId}:{较大 userId}，按 ASCII 字节序比较（与服务端一致）。 */
