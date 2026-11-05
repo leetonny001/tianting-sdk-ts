@@ -213,3 +213,19 @@ describe('发送队列与状态机（FE-005、PRD F-MSG-03）', () => {
     expect(h.im.messages(AB).map((m) => m.seq)).toEqual([1, 2]);
   });
 });
+
+describe('被踢时的待发消息', () => {
+  it('发给还不在会话列表里的新联系人：也标记失败并发 sendFailed（AC-AUTH-03-6）', async () => {
+    const h = setup();
+    const failed: string[] = [];
+    h.im.on('sendFailed', (convId, id, why) => failed.push(`${convId}/${id}/${why}`));
+    h.im.connect('t');
+    const c = await h.login('alice', []);
+    expect(h.im.send('c2c:alice:carol', 'hi')).toMatchObject({ ok: true });
+    expect(h.im.conversations().map((x) => x.convId)).not.toContain('c2c:alice:carol');
+    c.receive({ cmd: 'event', data: { type: 'kicked', reason: 'banned' } });
+    c.drop(4012, 'banned');
+    expect(failed).toEqual(['c2c:alice:carol/cid-0001/kicked']);
+    expect(status(h, 'c2c:alice:carol')).toEqual(['cid-0001:failed(kicked)']);
+  });
+});

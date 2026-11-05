@@ -330,6 +330,11 @@ export class Store {
     return l;
   }
 
+  /** 有消息列表的会话（可能还不在会话列表里）。 */
+  messageConvIds(): string[] {
+    return [...this.msgs.keys()];
+  }
+
   messages(convId: string): Message[] {
     return this.msgs.get(convId)?.snapshot() ?? [];
   }

@@ -347,6 +347,23 @@ describe('红点、relationOf、过期按服务端时间（FE-102）', () => {
 });
 
 describe('资料缓存、批量查资料、我的群聊（FE-103）', () => {
+  it('getUsers：跨批时等全部批次回来才返回，不漏人', async () => {
+    const { h, c } = await loggedIn();
+    const ids = Array.from({ length: 150 }, (_, i) => `u${i}`);
+    const profile = (userId: string) => ({ userId, nickname: userId, avatar: '', official: false });
+    let settled = false;
+    const all = h.im.getUsers(ids).then((r) => {
+      settled = true;
+      return r;
+    });
+    await flush();
+    c.ack('users', { users: ids.slice(0, 100).map(profile) });
+    await flush();
+    expect(settled).toBe(false);
+    c.ack('users', { users: ids.slice(100).map(profile) });
+    expect((await all).length).toBe(150);
+  });
+
   it('getUsers：同一事件循环内合并、每批最多 100、命中缓存不请求；10 分钟后过期重查', async () => {
     const { h, c } = await loggedIn();
     const ids = Array.from({ length: 150 }, (_, i) => `u${i}`);

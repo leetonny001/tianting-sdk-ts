@@ -691,7 +691,8 @@ export class IMClient extends Emitter<ClientEvents> {
   /** 被踢或不可重连的关闭：发送中 / 排队的消息全部标记失败（AC-AUTH-03-6），通知界面回到登录页。 */
   private onFatal(r: FatalReason): void {
     this.clearSocial(); // 被踢：清空全部社交状态（PRD-social 10.2 节）
-    for (const c of this.store.conversations()) this.failPending(c.convId);
+    // 按消息列表遍历：第一次发给新联系人时，会话还不在会话列表里（AC-AUTH-03-6）。
+    for (const convId of this.store.messageConvIds()) this.failPending(convId);
     this.emit('fatal', r);
   }
 
@@ -988,15 +989,17 @@ export class IMClient extends Emitter<ClientEvents> {
     const missing = ids.filter((id) => this.profiles.needsFetch(id));
     if (missing.length) {
       const first = this.usersQueue.size === 0;
-      const done = new Promise<void>((resolve) => {
-        for (const id of missing) {
-          const waiters = this.usersQueue.get(id) ?? [];
-          waiters.push(resolve);
-          this.usersQueue.set(id, waiters);
-        }
-      });
+      // 每个 id 一个 Promise：跨批时要等这次要的人都回来，只等第一批会漏人。
+      const done = missing.map(
+        (id) =>
+          new Promise<void>((resolve) => {
+            const waiters = this.usersQueue.get(id) ?? [];
+            waiters.push(resolve);
+            this.usersQueue.set(id, waiters);
+          }),
+      );
       if (first) queueMicrotask(() => void this.flushUsers());
-      await done;
+      await Promise.all(done);
     }
     return ids.map((id) => this.profiles.fresh(id)).filter((p): p is UserProfile => !!p);
   }
