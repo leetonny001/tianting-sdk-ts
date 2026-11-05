@@ -12,6 +12,7 @@ import { Emitter } from './emitter.js';
 import { ErrorCode, IMError } from './errors.js';
 import { silentLogger, type Logger } from './logger.js';
 import { MuteTable, type MuteInfo } from './mute.js';
+import { PUSH_DEFAULTS, PushSync, type Push, type PushLimits, type PushStart, type PushSyncAck } from './push.js';
 import {
   groupConvId,
   parseConvId,
@@ -81,6 +82,10 @@ export interface IMClientOptions {
   isVisible?: () => boolean;
   /** 是否自动监听浏览器的 online / visibilitychange 事件（浏览器里默认开启）。 */
   browserEvents?: boolean;
+  /** 没有游标时从哪里开始收推送（PRD-live C10）：默认 beginning；latest 只建立游标不回放，灰度用。 */
+  pushStart?: PushStart;
+  /** 覆盖推送的上限和等待时间（都未校准，4.3、4.4 节）。 */
+  pushLimits?: Partial<PushLimits>;
 }
 
 const DEFAULTS: IMClientTimings = {
@@ -134,6 +139,13 @@ type ClientEvents = {
   socialSettings: [SocialSettings];
   /** 群资料或成员变了（M4）：SDK 已经用 groupInfo 更新了本地会话；打开着群设置的页面直接用 info，不必再查。 */
   groupChanged: [groupId: string, info: GroupInfo];
+  /**
+   * 系统推送（PRD-live 4.8 节）：只有这个事件的监听器才算订阅者。注册后到下一个微任务才交付积压，
+   * 有订阅者才会补拉。带 pushSeq 的至少一次，业务按 pushId 幂等；不带的至多一次。
+   */
+  push: [Push];
+  /** 一轮补拉结束（4.8 节）。可选，不影响交付。 */
+  pushSynced: [{ latestSeq: number }];
 };
 
 /** 社交命令的选项。 */
@@ -194,6 +206,7 @@ export class IMClient extends Emitter<ClientEvents> {
   private mutes = new MuteTable();
   private muteKey = this.mutes.key();
   private muteTimer: TimerHandle | null = null;
+  private readonly pushes: PushSync;
 
   constructor(o: IMClientOptions) {
     super();
@@ -220,6 +233,15 @@ export class IMClient extends Emitter<ClientEvents> {
       random: o.random ?? Math.random,
       ...this.t,
     });
+    this.pushes = new PushSync({
+      clock: this.clock,
+      log: this.log,
+      pushStart: o.pushStart ?? 'beginning',
+      limits: { ...PUSH_DEFAULTS, ...o.pushLimits },
+      request: (data) => this.conn.request<PushSyncAck>('pushSync', data),
+      onSynced: (latestSeq) => this.emit('pushSynced', { latestSeq }),
+      onListenerError: (err) => this.onListenerError(err),
+    });
     this.conn.on('state', (s) => this.onState(s));
     this.conn.on('connected', (a) => void this.onConnected(a));
     this.conn.on('frame', (f) => this.onFrame(f));
@@ -228,6 +250,16 @@ export class IMClient extends Emitter<ClientEvents> {
   }
 
   // ---- 公开接口 ----
+
+  override on<K extends keyof ClientEvents>(event: K, fn: (...args: ClientEvents[K]) => void): () => void {
+    if (event === 'push') return this.pushes.subscribe(fn as unknown as (p: Push) => void);
+    return super.on(event, fn);
+  }
+
+  /** 推送游标（已交付的最大连续序号）：还没有游标时为 null。 */
+  pushCursor(): number | null {
+    return this.pushes.cursor;
+  }
 
   /** 当前用户（第一次连接成功后可用）。 */
   get userId(): string {
@@ -385,6 +417,7 @@ export class IMClient extends Emitter<ClientEvents> {
   // ---- 连接事件 ----
 
   private onState(s: ConnState): void {
+    if (s === 'disconnected') this.pushes.onDisconnected();
     this.emit('state', s);
     if (s === 'connected') {
       if (this.bannerTimer !== null) this.clock.clearTimeout(this.bannerTimer);
@@ -412,6 +445,7 @@ export class IMClient extends Emitter<ClientEvents> {
     this.mutes.setUser(a.mutedUntil); // 没有这个字段表示没有用户级禁言（离线期间可能已经解除）
     this.mutesChanged();
     this.flushQueued();
+    this.pushes.onAuth(a.userId, a.serverTime); // 不等 convs、socialSync，互不阻塞（AC-PUSH-03-24）
     try {
       const ack = await this.conn.request<ConvsAck>('convs', {});
       this.applyConvs(ack);
@@ -485,6 +519,10 @@ export class IMClient extends Emitter<ClientEvents> {
   private onFrame(f: InboundFrame): void {
     if (f.cmd === 'msg') {
       this.onMessage(f.data as ServerMessage);
+      return;
+    }
+    if (f.cmd === 'push') {
+      this.pushes.onLive(f.data);
       return;
     }
     if (f.cmd !== 'event') return;
@@ -861,6 +899,7 @@ export class IMClient extends Emitter<ClientEvents> {
     if (this.readTimer !== null) this.clock.clearTimeout(this.readTimer);
     this.readTimer = null;
     this.store = new Store(() => this.self);
+    this.pushes.logout();
     this.mutes.clear();
     this.mutesChanged();
     this.clearSocial();

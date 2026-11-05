@@ -49,6 +49,23 @@ im.debugExport();                // 调试：内存里的会话和全部消息�
 
 重连后 SDK 会重新拉一遍已加载的 seq 范围：断开期间被删除的消息不会再发 `msgDeleted`，只有 `sync` 能拿到。
 
+## 系统推送（PRD-live v1.0 第 4 节）
+
+```ts
+const off = im.on('push', (p) => {
+  // { pushId, type, data, ts, target, roomId?, pushSeq?, replayed }，按 type 分发由业务负责
+});
+im.on('pushSynced', ({ latestSeq }) => …); // 一轮补拉结束，可选
+new IMClient({ url, pushStart: 'latest' }); // 没有游标时只建立游标、不回放（灰度用），默认 'beginning'
+```
+
+- **只有 `push` 的监听器才算订阅者**：没有订阅者时不发 `pushSync`，带 `pushSeq` 的实时帧丢弃，之后从收件箱补回；不带 `pushSeq` 的（全员、按房间、`ttlSeconds=0`）进上限 500 的队列，溢出丢最旧。
+- 第一个订阅者到下一个微任务才生效：先交付队列，再补拉；同一微任务内注册的都能收到积压。
+- 带 `pushSeq` 的至少一次，业务按 `pushId` 幂等处理；不带的至多一次。业务回调抛异常不影响 SDK。
+- `replayed = ts < T0`，`T0` 是本实例上该账号第一次 `auth` 的 `serverTime`，重连不变：闪断期间的是 `false`，刷新后补到的旧推送是 `true`。
+- 没有持久化：游标只在内存，新实例和换账号都从 `afterSeq: 0` 开始。服务端未开启（4001）时静默，这次连接内不再发。
+- SDK 不把 `data` 写进日志。行为判据是 `protocol/vectors/push-sync.json`（`test/push-vectors.test.ts`，`persistence=true` 的用例跳过）。
+
 ## 删除失败的消息（PRD-ui G-UI-14）
 
 ```ts
