@@ -204,7 +204,7 @@ export class IMClient extends Emitter<ClientEvents> {
   };
   private usersQueue = new Map<string, Array<() => void>>();
   private mutes = new MuteTable();
-  private muteKey = this.mutes.key();
+  private muteKey = this.mutes.key() + '[]'; // 没有全群禁言时的角色部分，见 mutesChanged
   private muteTimer: TimerHandle | null = null;
   private readonly pushes: PushSync;
 
