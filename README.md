@@ -49,6 +49,12 @@ im.debugExport();                // 调试：内存里的会话和全部消息�
 
 重连后 SDK 会重新拉一遍已加载的 seq 范围：断开期间被删除的消息不会再发 `msgDeleted`，只有 `sync` 能拿到。
 
+## 删除失败的消息（PRD-ui G-UI-14）
+
+```ts
+im.removeFailed(convId, clientMsgId); // → boolean。只对 failed 有效，不发帧；pendingCount 减 1；本次登录内不再出现（晚到的 ack、sync 也不会）
+```
+
 ## 开发
 
 需要 Node 22.12+。

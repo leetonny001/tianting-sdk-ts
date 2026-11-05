@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { ErrorCode, type FatalReason } from '../src/index.js';
-import { conv, flush, setup } from './helpers.js';
+import { conv, flush, msg, setup } from './helpers.js';
 
 const AB = 'c2c:alice:bob';
 
@@ -116,6 +116,62 @@ describe('发送队列与状态机（FE-005、PRD F-MSG-03）', () => {
     await flush();
     expect(status(h)).toEqual(['cid-0001:sent#1']);
     expect(h.im.messages(AB)[0]?.msgId).toBe('m1');
+  });
+
+  it('removeFailed：只移除失败的消息，pendingCount 减 1，不发帧，之后重发无效（AC-UI-09-5、G-UI-14）', async () => {
+    const h = setup();
+    const counts: number[] = [];
+    h.im.on('pendingCount', (n) => counts.push(n));
+    h.im.connect('t');
+    const c = await h.login();
+    h.im.send(AB, 'sent one');
+    c.ack('send', { msgId: 'm1', convId: AB, seq: 1, ts: 1 });
+    await flush();
+    h.im.send(AB, 'fails');
+    h.clock.advance(10_000);
+    await flush();
+    expect(status(h)).toEqual(['cid-0001:sent#1', 'cid-0002:failed(timeout)']);
+    expect(h.im.pendingCount()).toBe(1);
+    const frames = c.frames().length;
+
+    expect(h.im.removeFailed(AB, 'cid-0001')).toBe(false); // sent 不动
+    expect(h.im.removeFailed(AB, 'nope')).toBe(false);
+    expect(status(h)).toEqual(['cid-0001:sent#1', 'cid-0002:failed(timeout)']);
+
+    expect(h.im.removeFailed(AB, 'cid-0002')).toBe(true);
+    expect(status(h)).toEqual(['cid-0001:sent#1']);
+    expect(h.im.pendingCount()).toBe(0);
+    expect(counts.at(-1)).toBe(0);
+    expect(h.im.removeFailed(AB, 'cid-0002')).toBe(false);
+    h.im.retry(AB, 'cid-0002');
+    expect(c.frames().length).toBe(frames);
+    expect(status(h)).toEqual(['cid-0001:sent#1']);
+  });
+
+  it('removeFailed：发送中 / 排队的消息不能移除', async () => {
+    const h = setup();
+    h.im.connect('t');
+    await h.login();
+    h.im.send(AB, 'sending');
+    expect(h.im.removeFailed(AB, 'cid-0001')).toBe(false);
+    expect(status(h)).toEqual(['cid-0001:sending']);
+  });
+
+  it('removeFailed 之后，晚到的 ack 和 sync 都不能让它再出现（AC-UI-09-5）', async () => {
+    const h = setup();
+    h.im.connect('t');
+    const c = await h.login();
+    h.im.send(AB, 'timed out');
+    h.clock.advance(10_000);
+    await flush();
+    h.im.removeFailed(AB, 'cid-0001');
+    c.ack('send', { msgId: 'm1', convId: AB, seq: 1, ts: 1 }); // 超时后 ack 才到
+    await flush();
+    expect(h.im.messages(AB)).toEqual([]);
+    c.receive({ cmd: 'msg', data: { ...msg(AB, 1, 'alice', 'timed out'), clientMsgId: 'cid-0001' } });
+    await flush();
+    expect(h.im.messages(AB)).toEqual([]);
+    expect(h.im.pendingCount()).toBe(0);
   });
 
   it('被踢时发送中和排队的消息全部标记失败（AC-AUTH-03-6）', async () => {

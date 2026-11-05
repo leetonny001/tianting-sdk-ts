@@ -313,6 +313,16 @@ export class IMClient extends Emitter<ClientEvents> {
   }
 
   /**
+   * 从本地移除一条失败的消息（PRD-ui G-UI-14）：不发任何帧，不影响服务端。
+   * 只对 failed 状态有效，否则不动并返回 false。移除后 pendingCount 减 1，本次登录内不再出现。
+   */
+  removeFailed(convId: string, clientMsgId: string): boolean {
+    if (!this.store.list(convId).removeFailed(clientMsgId)) return false;
+    this.emitMessages(convId);
+    return true;
+  }
+
+  /**
    * 向前翻页加载历史（PRD F-MSG-05）：第一次从最新开始（beforeSeq = maxSeq + 1，20 条），
    * 之后从已加载的最早一条继续往前。返回是否还有更早的。
    */

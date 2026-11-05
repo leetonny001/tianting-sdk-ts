@@ -78,6 +78,8 @@ class MessageList {
   // 已知被删除的 msgId / seq：之后才到的 sync 结果、发送 ack 带着原文也不能写回来。
   private deletedIds = new Set<string>();
   private deletedSeqs = new Set<number>();
+  // 本地删除过的失败消息（G-UI-14）：它可能其实到了服务端，之后的 ack、sync 不能让它再出现。
+  private removedClient = new Set<string>();
   /** 已加载的最早 seq（用于向前翻页）；0 表示还没加载过。 */
   oldestSeq = 0;
   /** 向前翻页是否还有更早的消息。 */
@@ -88,6 +90,7 @@ class MessageList {
    * 已有的消息只会变成已删除。返回合并后的消息，没有变化时为 null。
    */
   addServer(m: ServerMessage): Message | null {
+    if (this.removedClient.has(m.clientMsgId)) return null;
     const deleted = m.deleted === true || this.isDeleted(m.msgId, m.seq);
     if (this.byMsgId.has(m.msgId)) {
       const old = this.bySeq.get(m.seq);
@@ -150,6 +153,16 @@ class MessageList {
 
   local(clientMsgId: string): Message | undefined {
     return this.byClient.get(clientMsgId);
+  }
+
+  /** 移除一条失败的本地消息，并记住它的 clientMsgId。不是失败状态时不动，返回 false。 */
+  removeFailed(clientMsgId: string): boolean {
+    const m = this.byClient.get(clientMsgId);
+    if (!m || m.status !== 'failed' || m.seq !== undefined) return false;
+    this.unsent = this.unsent.filter((x) => x !== m);
+    this.byClient.delete(clientMsgId);
+    this.removedClient.add(clientMsgId);
+    return true;
   }
 
   has(seq: number): boolean {
