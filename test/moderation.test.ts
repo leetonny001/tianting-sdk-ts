@@ -333,8 +333,136 @@ describe('禁言（FE-433、AC-ADM-40-4、40-5、40-6、41-6）', () => {
   it('不认识的 scope 忽略', async () => {
     const h = setup();
     const c = await online(h);
-    c.receive(muted({ scope: 'groupAll', groupId: 'g1', mutedUntil: null }));
+    c.receive(muted({ scope: 'everyone', groupId: 'g1', mutedUntil: null }));
     expect(h.im.muteState(G1)).toBeNull();
+  });
+
+  describe('全群禁言（FE-354、AC-UI-41-6、AC-ADM-42-2）', () => {
+    const ALL = { scope: 'groupAll', groupId: 'g1', mutedUntil: null };
+    const login = async (h: Harness, role: 'owner' | 'admin' | 'member' | undefined, extra = {}) => {
+      h.im.connect('t');
+      return h.login('alice', [
+        conv({ convId: G1, ...(role ? { myRole: role } : {}), ...extra }),
+        conv({ convId: G2, myRole: 'member' }),
+        conv({ convId: AB }),
+      ]);
+    };
+
+    it('普通成员（和没有角色信息时）：muted 事件只禁该群；unmuted 解除并发事件', async () => {
+      for (const role of ['member', undefined] as const) {
+        const h = setup();
+        const c = await login(h, role);
+        let events = 0;
+        h.im.on('muteChanged', () => events++);
+        c.receive(muted(ALL));
+        expect(h.im.muteState(G1)).toEqual(ALL);
+        expect(h.im.muteState(G2)).toBeNull();
+        expect(h.im.muteState(AB)).toBeNull();
+        expect(events).toBe(1);
+        c.receive(unmuted({ scope: 'groupAll', groupId: 'g2' })); // 别的群解除不影响 g1
+        expect(h.im.muteState(G1)).toEqual(ALL);
+        c.receive(unmuted({ scope: 'groupAll', groupId: 'g1' }));
+        expect(h.im.muteState(G1)).toBeNull();
+        expect(events).toBe(2);
+      }
+    });
+
+    it.each(['owner', 'admin'] as const)('%s 不受限：收到事件也不禁用，convs 带 allMuted 也不禁用', async (role) => {
+      const h = setup();
+      const c = await login(h, role, { allMuted: true });
+      expect(h.im.muteState(G1)).toBeNull();
+      c.receive(muted(ALL));
+      expect(h.im.muteState(G1)).toBeNull();
+    });
+
+    it('单独禁言优先于全群禁言；群主被单独禁言仍然禁用', async () => {
+      const h = setup();
+      const c = await login(h, 'owner');
+      c.receive(muted(ALL));
+      const until = h.clock.now() + 60_000;
+      c.receive(muted({ scope: 'group', groupId: 'g1', mutedUntil: until }));
+      expect(h.im.muteState(G1)).toEqual({ scope: 'group', groupId: 'g1', mutedUntil: until });
+      c.receive(unmuted({ scope: 'group', groupId: 'g1' }));
+      c.receive(muted({ scope: 'user', mutedUntil: null }));
+      expect(h.im.muteState(G1)?.scope).toBe('user');
+    });
+
+    it('convs 的 allMuted：离线开启上线即禁用；下一次 convs 没有时解除；不进会话视图', async () => {
+      const h = setup();
+      const c = await login(h, 'member', { allMuted: true });
+      expect(h.im.muteState(G1)).toEqual(ALL);
+      expect(h.im.conversations().find((x) => x.convId === G1)).not.toHaveProperty('allMuted');
+      c.drop(1006, 'network');
+      h.clock.advance(60_000);
+      const c2 = h.transport.current;
+      c2.open();
+      c2.ack('auth', { userId: 'alice', serverTime: h.clock.now() });
+      await flush();
+      c2.ack('convs', { convs: [conv({ convId: G1, myRole: 'member' })], truncated: false });
+      await flush();
+      expect(h.im.muteState(G1)).toBeNull();
+    });
+
+    it('convAdded 带 allMuted：全群禁言期间入群立即禁用；被移出后清除', async () => {
+      const h = setup();
+      const c = await login(h, 'member');
+      const G3 = 'group:g3';
+      c.receive({
+        cmd: 'event',
+        data: { type: 'convAdded', conv: conv({ convId: G3, myRole: 'member', allMuted: true }) },
+      });
+      expect(h.im.muteState(G3)).toEqual({ scope: 'groupAll', groupId: 'g3', mutedUntil: null });
+      c.receive({ cmd: 'event', data: { type: 'convRemoved', convId: G3, reason: 'removed' } });
+      expect(h.im.muteState(G3)).toBeNull();
+    });
+
+    it('发送返回 4031 groupAll：普通成员显示禁用条，消息标记失败不重发', async () => {
+      const h = setup();
+      const c = await login(h, 'member');
+      const r = h.im.send(G1, 'hi');
+      if (!r.ok) throw new Error('send');
+      await flush();
+      c.receive({ id: c.last('send').id, cmd: 'ack', error: { code: 4031, msg: 'muted', details: ALL } });
+      await flush();
+      expect(h.im.muteState(G1)).toEqual(ALL);
+      expect(h.im.messages(G1).find((x) => x.clientMsgId === r.message.clientMsgId)).toMatchObject({
+        status: 'failed',
+        error: 4031,
+      });
+    });
+
+    it('本地角色过期（已被取消管理员）：4031 以服务端为准显示禁用条，补拉角色后仍然禁用；角色确实是管理员时恢复', async () => {
+      const h = setup();
+      const c = await login(h, 'admin');
+      c.receive(muted(ALL));
+      expect(h.im.muteState(G1)).toBeNull();
+      h.im.send(G1, 'hi');
+      await flush();
+      c.receive({ id: c.last('send').id, cmd: 'ack', error: { code: 4031, msg: 'muted', details: ALL } });
+      await flush();
+      expect(h.im.muteState(G1)).toEqual(ALL);
+      const info = { groupId: 'g1', name: 'g', myRole: 'member', memberCount: 3 };
+      c.ack('groupInfo', info);
+      await flush();
+      expect(h.im.muteState(G1)).toEqual(ALL);
+      // 又被设回管理员：groupChanged → groupInfo，界面收到通知、恢复输入框。
+      let events = 0;
+      h.im.on('muteChanged', () => events++);
+      c.receive({ cmd: 'event', data: { type: 'groupChanged', groupId: 'g1' } });
+      await flush();
+      c.ack('groupInfo', { ...info, myRole: 'admin' });
+      await flush();
+      expect(h.im.muteState(G1)).toBeNull();
+      expect(events).toBe(1);
+    });
+
+    it('断开清除：退出登录后没有残留', async () => {
+      const h = setup();
+      const c = await login(h, 'member');
+      c.receive(muted(ALL));
+      h.im.disconnect();
+      expect(h.im.muteState(G1)).toBeNull();
+    });
   });
 
   it('auth ack 的 mutedUntil：离线被禁言上线即禁用；永久 null；重连时没有这个字段表示已解除（AC-ADM-40-6）', async () => {

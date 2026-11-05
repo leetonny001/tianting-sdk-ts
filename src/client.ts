@@ -319,11 +319,11 @@ export class IMClient extends Emitter<ClientEvents> {
   }
 
   /**
-   * 这个会话当前的禁言（PRD-admin F-ADM-40、41）：没有被禁言时为 null。
-   * 按服务端时间判断到期；用户级优先，群内禁言只影响该群。
+   * 这个会话当前的禁言（PRD-admin F-ADM-40、41、42）：没有被禁言时为 null。
+   * 按服务端时间判断到期；用户级优先，群内禁言只影响该群；全群禁言不限制群主、管理员。
    */
   muteState(convId: string): MuteInfo | null {
-    return this.mutes.get(convId, this.serverNow());
+    return this.mutes.get(convId, this.serverNow(), this.store.conversation(convId)?.myRole);
   }
 
   /**
@@ -530,7 +530,7 @@ export class IMClient extends Emitter<ClientEvents> {
     switch (ev.type) {
       case 'convAdded':
         this.store.upsertConversation(ev.conv);
-        this.setGroupMute(ev.conv.convId, ev.conv.mutedUntil);
+        this.setGroupMute(ev.conv.convId, ev.conv.mutedUntil, ev.conv.allMuted);
         this.mutesChanged();
         this.emitConversations();
         return;
@@ -593,6 +593,7 @@ export class IMClient extends Emitter<ClientEvents> {
   private applyMute(scope: unknown, groupId: unknown, until: number | null | undefined): void {
     if (scope === 'user') this.mutes.setUser(until);
     else if (scope === 'group' && typeof groupId === 'string') this.mutes.setGroup(groupId, until);
+    else if (scope === 'groupAll' && typeof groupId === 'string') this.mutes.setGroupAll(groupId, until !== undefined);
     else return;
     this.mutesChanged();
   }
@@ -600,19 +601,36 @@ export class IMClient extends Emitter<ClientEvents> {
   /** 发送返回 4031：按 details 更新状态，界面显示禁用条。这条消息只标记失败，不自动重发。 */
   private onMutedAck(details: Readonly<Record<string, unknown>> | undefined): void {
     if (!details) return;
+    if (details.scope === 'groupAll' && typeof details.groupId === 'string') {
+      this.onGroupAllDenied(details.groupId);
+      return;
+    }
     const until = details.mutedUntil;
     if (until === null || typeof until === 'number') this.applyMute(details.scope, details.groupId, until);
   }
 
-  private setGroupMute(convId: string, until: number | null | undefined): void {
-    if (convId.startsWith('group:')) this.mutes.setGroup(convId.slice('group:'.length), until);
+  /** 全群禁言下发送被拒：以服务端为准显示禁用条。本地角色还是群主 / 管理员说明角色过期了，补拉一次。 */
+  private onGroupAllDenied(groupId: string): void {
+    this.mutes.setGroupAll(groupId, true, true);
+    this.mutesChanged();
+    const role = this.store.conversation(groupConvId(groupId))?.myRole;
+    if (role === 'owner' || role === 'admin') this.onGroupChanged(groupId);
+  }
+
+  private setGroupMute(convId: string, until: number | null | undefined, allMuted = false): void {
+    if (!convId.startsWith('group:')) return;
+    const groupId = convId.slice('group:'.length);
+    this.mutes.setGroup(groupId, until);
+    this.mutes.setGroupAll(groupId, allMuted);
   }
 
   /** 表有变化时发事件，并按最早的到期时间重新定时。 */
   private mutesChanged(): void {
     if (this.muteTimer !== null) this.clock.clearTimeout(this.muteTimer);
     this.muteTimer = null;
-    const key = this.mutes.key();
+    // 全群禁言是否限制我还取决于我的角色：角色变了也要通知界面。
+    const roles = this.mutes.groupAllIds().map((g) => this.store.conversation(groupConvId(g))?.myRole);
+    const key = this.mutes.key() + JSON.stringify(roles);
     if (key !== this.muteKey) {
       this.muteKey = key;
       this.emit('muteChanged');
@@ -671,7 +689,7 @@ export class IMClient extends Emitter<ClientEvents> {
     const gone = this.store.setConversations(ack.convs, ack.truncated);
     this.lastRefreshAt = this.clock.now();
     for (const c of ack.convs) {
-      this.setGroupMute(c.convId, c.mutedUntil);
+      this.setGroupMute(c.convId, c.mutedUntil, c.allMuted);
       // 错过了 msgDeleted 的话，摘要是唯一的线索：本地已加载的那条也要清掉。
       if (c.lastMsg?.deleted && this.store.deleteMessages(c.convId, [c.lastMsg.msgId], [])) this.emitMessages(c.convId);
     }
@@ -1087,7 +1105,7 @@ export class IMClient extends Emitter<ClientEvents> {
       try {
         const ack = await this.conn.request<{ groupId: string; conv: ServerConversation }>('groupCreate', data);
         this.store.upsertConversation(ack.conv);
-        this.setGroupMute(ack.conv.convId, ack.conv.mutedUntil);
+        this.setGroupMute(ack.conv.convId, ack.conv.mutedUntil, ack.conv.allMuted);
         this.mutesChanged();
         this.emitConversations();
         const conv = this.store.conversation(ack.conv.convId)!;
@@ -1137,6 +1155,8 @@ export class IMClient extends Emitter<ClientEvents> {
   async getGroupInfo(groupId: string): Promise<GroupInfo> {
     const info = await this.conn.request<GroupInfo>('groupInfo', { groupId });
     if (this.store.updateGroupMeta(groupConvId(groupId), info)) this.emitConversations();
+    this.mutes.clearGroupAllDenied(groupId);
+    this.mutesChanged();
     return info;
   }
 

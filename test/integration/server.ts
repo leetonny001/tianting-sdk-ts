@@ -10,7 +10,15 @@ export const ADMIN_KEY = 'sdk-it-admin-key-0123456789abcdef';
 // 只给这个测试服务端用的调用方（PRD-admin F-KEY-02）：第二批管理接口不接受旧 X-Admin-Key。
 const CALLER_ID = 'sdk-it';
 const CALLER_SECRET = 'sdk-it-caller-secret-0123456789abcdef';
-const CALLER_SCOPES = ['user.ban', 'msg.delete', 'mute.write', 'push.user', 'push.all'];
+const CALLER_SCOPES = [
+  'user.ban',
+  'msg.delete',
+  'mute.write',
+  'push.user',
+  'push.all',
+  'group.write',
+  'social.settings',
+];
 // 持有 push.all 的调用方必须配 pushTypes，否则 IM_PUSH_ENABLED 开启时启动失败（PRD-live F-PUSH-09 规则 3）。
 const CALLER_PUSH_TYPES = ['notice', 'promo'];
 /** 打开第二批功能（IM_V13_ADMIN_FEATURES）需要的环境变量。 */

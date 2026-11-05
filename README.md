@@ -42,7 +42,7 @@ messageFor(cmd, code, { strangerMsgLimit });           // "命令 + 错误码"�
 im.on('fatal', (r) => …);        // 封禁：{ kind: 'kicked', reason: 'suspended', code: 4012, until }，until 永久为 null；不重连
 im.on('messages', (id, list) => …); // 被删的消息 deleted = true、body = {}，seq 不变；原文从内存清除
 // 会话摘要：lastMsg.deleted = true 时没有 text；未读不变
-im.muteState(convId);            // null，或 { scope: 'user' | 'group', groupId?, mutedUntil }（永久为 null）
+im.muteState(convId);            // null，或 { scope: 'user' | 'group' | 'groupAll', groupId?, mutedUntil }（永久为 null；全群禁言不限制群主、管理员）
 im.on('muteChanged', () => …);   // muted / unmuted、auth ack、convs、发送返回 4031、到期（按服务端时间）
 im.debugExport();                // 调试：内存里的会话和全部消息副本（拷贝，不含 token）
 ```

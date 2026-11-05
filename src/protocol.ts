@@ -62,6 +62,8 @@ export interface ServerConversation {
   myRole?: GroupRole;
   /** 我在该群被禁言时才有，永久为 null（第二批）。 */
   mutedUntil?: number | null;
+  /** 该群开启了全群禁言时才有（P1，F-ADM-42）；群主、管理员也带，但不受限。 */
+  allMuted?: boolean;
 }
 
 export interface SendAck {

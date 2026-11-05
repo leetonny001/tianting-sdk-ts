@@ -300,7 +300,7 @@ export class Store {
   private lastList: Conversation[] | null = null;
 
   private fromServer(c: ServerConversation): ConvState {
-    const { mutedUntil: _, ...rest } = c; // 禁言状态由 IMClient 的 MuteTable 维护，事件和到期都会改它
+    const { mutedUntil: _, allMuted: __, ...rest } = c; // 禁言状态由 IMClient 的 MuteTable 维护，事件和到期都会改它
     const last = c.lastMsg;
     // 这份 convs 可能是删除之前生成的：已知被删除的消息不能把原文带回摘要。
     const stale = last && !last.deleted && this.msgs.get(c.convId)?.isDeleted(last.msgId);

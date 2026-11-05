@@ -151,6 +151,52 @@ describe('禁言（AC-ADM-40-4、40-5、40-6、41-6）', () => {
     );
   });
 
+  it('全群禁言（AC-ADM-42-1、42-2、AC-UI-41-6）：成员禁用、4031 scope=groupAll；群主不受限；关闭后恢复；离线开启上线可见', async () => {
+    const [o, a, m] = [uid('owner'), uid('admin'), uid('member')];
+    await srv.admin('POST', '/admin/users/import', { users: [o, a, m].map((userId) => ({ userId })) });
+    const groupId = uid('g');
+    const convId = `group:${groupId}`;
+    await srv.signed('POST', '/admin/groups', { groupId, name: groupId, members: [o, a, m], owner: o });
+    const owner = await login(o);
+    await owner.setGroupAdmin(groupId, a, true);
+    const adminIm = await login(a);
+    const member = await login(m);
+    const sendOk = async (im: IMClient, text: string) => {
+      const r = im.send(convId, text);
+      if (!r.ok) throw new Error('send');
+      await until(
+        () => im.messages(convId).find((x) => x.clientMsgId === r.message.clientMsgId)?.status === 'sent',
+        text,
+      );
+    };
+    await until(() => member.conversations().some((c) => c.convId === convId), 'member sees group');
+    await until(() => adminIm.conversations().find((c) => c.convId === convId)?.myRole === 'admin', 'admin role');
+
+    await srv.signed('POST', '/admin/mute', { scope: 'groupAll', groupId, reason: 'it' });
+    const want = { scope: 'groupAll', groupId, mutedUntil: null };
+    await until(() => member.muteState(convId), 'member muted');
+    expect(member.muteState(convId)).toEqual(want);
+    expect(owner.muteState(convId)).toBeNull();
+    expect(adminIm.muteState(convId)).toBeNull();
+    await sendOk(owner, 'owner speaks');
+    await sendOk(adminIm, 'admin speaks');
+    const r = member.send(convId, 'member speaks');
+    if (!r.ok) throw new Error('send');
+    const mine = () => member.messages(convId).find((x) => x.clientMsgId === r.message.clientMsgId);
+    await until(() => mine()?.status === 'failed', '4031');
+    expect(mine()).toMatchObject({ error: 4031 });
+
+    // 上线就拿到：新连接的 convs 带 allMuted。
+    const again = await login(m);
+    await until(() => again.muteState(convId), 'allMuted from convs');
+    expect(again.muteState(convId)).toEqual(want);
+
+    await srv.signed('POST', '/admin/unmute', { scope: 'groupAll', groupId, reason: 'it' });
+    await until(() => member.muteState(convId) === null, 'unmuted');
+    await until(() => again.muteState(convId) === null, 'unmuted on the second connection');
+    await sendOk(member, 'member back');
+  });
+
   it('离线时用户级禁言：auth ack 带 mutedUntil，一上线就禁言；永久为 null', async () => {
     const u = uid('u');
     await srv.admin('POST', '/admin/users/import', { users: [{ userId: u }] });
