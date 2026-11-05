@@ -15,6 +15,7 @@ import { MuteTable, type MuteInfo } from './mute.js';
 import {
   groupConvId,
   parseConvId,
+  parseConvIdStrict,
   type AuthAck,
   type ConvsAck,
   type InboundFrame,
@@ -269,6 +270,7 @@ export class IMClient extends Emitter<ClientEvents> {
     const check = checkText(raw);
     if (!check.ok) return check;
     if (!this.self) throw new NotConnectedError(); // 需要先连接成功一次，才知道自己是谁
+    parseConvIdStrict(convId, this.self); // 格式错误在入队前抛错：不留下永远"发送中"的消息
     const msg: Message = {
       clientMsgId: this.newId(),
       convId,
@@ -595,14 +597,14 @@ export class IMClient extends Emitter<ClientEvents> {
   private onMessage(m: ServerMessage): void {
     const prev = this.store.maxSeq(m.convId);
     if (!this.store.applyServerMessage(m)) return;
-    this.emitMessages(m.convId);
-    this.emitConversations();
     // 提示消息的摘要：本地按服务端同样的规则（只用昵称，F-SOC-29 规则 6）生成，下次 convs 时被权威文本覆盖。
     // 不在这里重拉 convs：大群里一次操作会让所有在线成员同时请求。
     if (m.type === 'tip' && m.body?.tip) {
       const nick = (u: string) => this.profileOf(u)?.nickname || u;
       this.store.setLastMsgText(m.convId, m.msgId, tipSummary(m.body.tip, nick));
     }
+    this.emitMessages(m.convId);
+    this.emitConversations();
     if (this.store.hasPlaceholder(m.convId)) this.refreshConversationsSoon();
     // 只对已经加载过的会话检测缺口：prev 为 0 说明本地还没有这个会话的消息。
     if (prev > 0 && m.seq > prev + 1) this.scheduleGapCheck(m.convId, prev, m.seq);

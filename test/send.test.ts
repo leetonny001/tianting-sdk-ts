@@ -242,3 +242,15 @@ describe('被踢时的待发消息', () => {
     expect(status(h, 'c2c:alice:carol')).toEqual(['cid-0001:failed(kicked)']);
   });
 });
+
+describe('发送前校验会话 ID', () => {
+  it('格式错误：抛错，不留下永远"发送中"的消息', async () => {
+    const h = setup();
+    h.im.connect('t');
+    const c = await h.login();
+    expect(() => h.im.send('nonsense', 'hi')).toThrow();
+    expect(h.im.messages('nonsense')).toEqual([]);
+    expect(h.im.pendingCount()).toBe(0);
+    expect(c.frames().filter((f) => f.cmd === 'send')).toHaveLength(0);
+  });
+});

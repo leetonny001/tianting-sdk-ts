@@ -506,6 +506,29 @@ describe('群（FE-110、FE-111）', () => {
     await expect(b).rejects.toMatchObject({ userId: 'eve' });
   });
 
+  it('tip 消息：事件回调里读到的已经是新摘要', async () => {
+    const { h, c } = await loggedIn();
+    const seen: (string | undefined)[] = [];
+    h.im.on('conversations', () => seen.push(h.im.conversations().find((x) => x.convId === 'group:gt')?.lastMsg?.text));
+    c.ack('convs', { convs: [], truncated: false });
+    c.receive({
+      cmd: 'msg',
+      data: {
+        msgId: 'tip1',
+        clientMsgId: 'tip-tip1',
+        convId: 'group:gt',
+        seq: 1,
+        from: '',
+        type: 'tip',
+        ts: 5,
+        body: { tip: { kind: 'ownerLeft', actor: '', targets: [], text: '群主已退出群聊' } },
+      },
+    });
+    await flush();
+    expect(seen.at(-1)).toBeTruthy();
+    expect(seen.filter((t) => t !== undefined).every((t) => t === seen.at(-1))).toBe(true);
+  });
+
   it('tip 消息入库、计入未读、from 可以为空；摘要本地生成，不重拉 convs', async () => {
     const h = setup();
     h.im.connect('t');
