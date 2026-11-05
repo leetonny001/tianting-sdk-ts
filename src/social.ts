@@ -158,7 +158,8 @@ export function tipText(tip: TipBody, me: string, nameOf: (userId: string) => st
       return you ? `你邀请 ${targets} 加入了群聊` : `${actor} 邀请 ${targets} 加入了群聊`;
     case 'ownerChanged':
       if (tip.actor) return `${spaced(actor, you)}将群主转让给 ${targets}`;
-      return tip.targets.length ? `${targets} 已成为群主` : '群主已退出群聊';
+      if (!tip.targets.length) return '群主已退出群聊';
+      return targets === '你' ? '你已成为群主' : `${targets} 已成为群主`;
     case 'adminSet':
       return `${spaced(actor, you)}将 ${targets} 设为管理员`;
     case 'adminUnset':
