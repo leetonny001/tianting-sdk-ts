@@ -157,6 +157,19 @@ describe('发送队列与状态机（FE-005、PRD F-MSG-03）', () => {
     expect(status(h)).toEqual(['cid-0001:sending']);
   });
 
+  it('removeFailed 只拦自己发的：别人用同一个 clientMsgId 发的消息照常显示', async () => {
+    const h = setup();
+    h.im.connect('t');
+    const c = await h.login();
+    h.im.send(AB, 'mine');
+    h.clock.advance(10_000);
+    await flush();
+    expect(h.im.removeFailed(AB, 'cid-0001')).toBe(true);
+    c.receive({ cmd: 'msg', data: { ...msg(AB, 1, 'bob', 'theirs'), clientMsgId: 'cid-0001' } });
+    await flush();
+    expect(h.im.messages(AB).map((m) => m.body?.text)).toEqual(['theirs']);
+  });
+
   it('removeFailed 之后，晚到的 ack 和 sync 都不能让它再出现（AC-UI-09-5）', async () => {
     const h = setup();
     h.im.connect('t');

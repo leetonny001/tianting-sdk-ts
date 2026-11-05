@@ -79,7 +79,8 @@ class MessageList {
   private deletedIds = new Set<string>();
   private deletedSeqs = new Set<number>();
   // 本地删除过的失败消息（G-UI-14）：它可能其实到了服务端，之后的 ack、sync 不能让它再出现。
-  private removedClient = new Set<string>();
+  /** 用户删掉的失败消息：clientMsgId → 发送者。clientMsgId 只在同一发送者内唯一，别人用同样的值不能被拦。 */
+  private removedClient = new Map<string, string>();
   /** 已加载的最早 seq（用于向前翻页）；0 表示还没加载过。 */
   oldestSeq = 0;
   /** 向前翻页是否还有更早的消息。 */
@@ -90,7 +91,7 @@ class MessageList {
    * 已有的消息只会变成已删除。返回合并后的消息，没有变化时为 null。
    */
   addServer(m: ServerMessage): Message | null {
-    if (this.removedClient.has(m.clientMsgId)) return null;
+    if (this.removedClient.get(m.clientMsgId) === m.from) return null;
     const deleted = m.deleted === true || this.isDeleted(m.msgId, m.seq);
     if (this.byMsgId.has(m.msgId)) {
       const old = this.bySeq.get(m.seq);
@@ -161,7 +162,7 @@ class MessageList {
     if (!m || m.status !== 'failed' || m.seq !== undefined) return false;
     this.unsent = this.unsent.filter((x) => x !== m);
     this.byClient.delete(clientMsgId);
-    this.removedClient.add(clientMsgId);
+    this.removedClient.set(clientMsgId, m.from);
     return true;
   }
 
