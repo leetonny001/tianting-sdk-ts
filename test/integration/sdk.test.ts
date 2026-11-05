@@ -247,6 +247,12 @@ describe('SDK × 真实服务端：群管理（FE-110、FE-111）', () => {
     await until(() => b.conversations().find((x) => x.convId === conv.convId)?.myRole === 'admin', 'b becomes admin');
 
     await b.updateGroup(groupId, { name: '周六球局', notice: '九点' });
+    // 操作者不刷新也能看到自己的提示消息（AC-UI-37-1、39-1）。
+    await until(
+      () => b.conversations().find((x) => x.convId === conv.convId)?.lastMsg?.text?.includes('公告') === true,
+      'operator sees own tip',
+    );
+    expect(b.conversations().find((x) => x.convId === conv.convId)?.unread).toBe(0);
     await until(() => a.conversations().find((x) => x.convId === conv.convId)?.name === '周六球局', 'renamed');
     expect(await a.getGroupInfo(groupId)).toMatchObject({
       notice: '九点',
