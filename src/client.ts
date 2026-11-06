@@ -155,12 +155,15 @@ type ClientEvents = {
   profileChanged: [userId: string];
 };
 
-/** 这一批认识的 securityNotice（server/internal/protocol/frames.go）。 */
+/** 这一批认识的 securityNotice：服务端实际发的全部（server/internal/account 的 notify 调用）。 */
 const SECURITY_NOTICE_KINDS: ReadonlySet<string> = new Set([
   'newDeviceLogin',
+  'passwordChanged',
+  'passwordRecovered',
   'recoveryCodeRegenerated',
   'refreshReplay',
   'refreshRateLimited',
+  'newIpPrefix',
 ]);
 
 export interface SecurityNotice {
