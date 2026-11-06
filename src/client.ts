@@ -156,7 +156,12 @@ type ClientEvents = {
 };
 
 /** 这一批认识的 securityNotice（server/internal/protocol/frames.go）。 */
-const SECURITY_NOTICE_KINDS: ReadonlySet<string> = new Set(['newDeviceLogin']);
+const SECURITY_NOTICE_KINDS: ReadonlySet<string> = new Set([
+  'newDeviceLogin',
+  'recoveryCodeRegenerated',
+  'refreshReplay',
+  'refreshRateLimited',
+]);
 
 export interface SecurityNotice {
   kind: string;

@@ -1224,6 +1224,20 @@ describe('TC-ACC-02-13 securityNotice（AC-ACC-02-13 的 SDK 部分）', () => {
     expect(got).toEqual([{ kind: 'newDeviceLogin', at: 123, platform: 'ios' }]);
     expect(h.logs.filter((l) => l.includes('listener error'))).toEqual([]);
   });
+
+  it('服务端发的四种 kind 都放行（AC-ACC-03-25、AC-ACC-03-45，F-ACC-05 规则 5）', async () => {
+    const h = setupAccount();
+    h.session(1, DAY);
+    const c = await h.online();
+    const got: string[] = [];
+    h.im.on('securityNotice', (n) => got.push(n.kind));
+    const kinds = ['newDeviceLogin', 'recoveryCodeRegenerated', 'refreshReplay', 'refreshRateLimited'];
+    for (const kind of [...kinds, 'newIpPrefix', '']) {
+      c.receive({ cmd: 'event', data: { type: 'securityNotice', kind, at: 1, platform: 'ios' } });
+    }
+    await flush();
+    expect(got).toEqual(kinds);
+  });
 });
 
 describe('TC-ACC-09-01 邀请码用完（AC-ACC-09-1 的 SDK 部分）', () => {

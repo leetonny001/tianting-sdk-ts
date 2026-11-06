@@ -162,7 +162,7 @@ describe('真实服务端：注册、登录、配置', () => {
     expect(d1.account.session).toBeNull();
   });
 
-  it('新设备登录：在线设备收到 securityNotice，账号安全有记录（TC-ACC-02-13）', async () => {
+  it('新设备登录、重新生成恢复码：在线设备收到 securityNotice，账号安全有记录（TC-ACC-02-13）', async () => {
     const d1 = device();
     const { username } = await newUser(d1);
     await d1.connect();
@@ -177,6 +177,14 @@ describe('真实服务端：注册、登录、配置', () => {
     const events = await d1.account.listEvents();
     expect(events.otherSessions.count).toBeGreaterThanOrEqual(1);
     expect(events.events.length).toBeGreaterThan(0);
+    // 同一个用户继续（注册按 IP 限流，这个文件没有余量再建一个）：其他 kind 也要到达 SDK（F-ACC-05 规则 5）。
+    await d2.account.regenerateRecoveryCode(PASSWORD);
+    const regen = await until(
+      () => notices.find((n) => n.kind === 'recoveryCodeRegenerated'),
+      'recoveryCodeRegenerated',
+      2_000,
+    );
+    expect(regen.platform).toBe('ios');
   });
 });
 

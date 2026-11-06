@@ -3,7 +3,17 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { SessionEndedError, type FatalReason, type SessionEnd } from '../src/index.js';
 import { flush } from './helpers.js';
-import { HOUR, PASSWORD, REFRESH, USER, accountSetup, authBody, jwt, type AccountHarness } from './support/account.js';
+import {
+  HOUR,
+  PASSWORD,
+  REFRESH,
+  USER,
+  accountSetup,
+  authBody,
+  jwt,
+  refreshToken,
+  type AccountHarness,
+} from './support/account.js';
 
 const DAY = 24 * HOUR;
 const MIN = 60_000;
@@ -751,5 +761,187 @@ describe('恢复码确认和换代交错：ack 只对当前未确认的那一代
     h.http.last(REFRESH).respond(200, authBody({ sid: 'sid2', gen: 2, accessExpiresAt: h.clock.now() + DAY }));
     await flush();
     expect(h.store.saved?.accessToken).toBe(jwt('sid2', 2));
+  });
+});
+
+// logout 进行中登录（frontend-chat 问题表 A1、I6）：logout 的收尾只作用于它开始时的那个会话。
+describe('A1 logout 进行中登录', () => {
+  const LOGIN = '/v1/account/login';
+  async function loggingOut(h: AccountHarness) {
+    h.session(1, DAY, 'old');
+    const c = await h.online();
+    const out = h.account.logout();
+    await flush();
+    return { c, out, call: h.http.last(LOGOUT) };
+  }
+  async function loginAgain(h: AccountHarness, sid = 'new') {
+    const p = h.account.login('alice_1', PASSWORD);
+    await flush();
+    h.http.last(LOGIN).respond(200, authBody({ sid, gen: 1, accessExpiresAt: h.clock.now() + DAY }));
+    await p;
+    await flush();
+  }
+
+  it('旧 logout 的响应晚到：新会话和存储都还在，没有 ended，新 token 连接', async () => {
+    const h = setupAccount();
+    const w = watch(h);
+    const { call, out } = await loggingOut(h);
+    await loginAgain(h);
+    expect(h.account.session?.accessToken).toBe(jwt('new', 1));
+    expect(h.store.saved?.accessToken).toBe(jwt('new', 1));
+    call.respond(200, {});
+    await expect(out).resolves.toBe(true);
+    await flush();
+    expect(h.account.session?.accessToken).toBe(jwt('new', 1));
+    expect(h.store.saved?.accessToken).toBe(jwt('new', 1));
+    expect(w.ended).toEqual([]);
+    expect(w.fatal).toEqual([]);
+    expect(authToken(await h.login(USER))).toBe(jwt('new', 1));
+  });
+
+  it('旧 logout 失败：同样不碰新会话', async () => {
+    const h = setupAccount();
+    const w = watch(h);
+    const { call, out } = await loggingOut(h);
+    await loginAgain(h);
+    call.fail();
+    await expect(out).resolves.toBe(false);
+    await flush();
+    expect(h.account.session?.accessToken).toBe(jwt('new', 1));
+    expect(h.store.saved?.accessToken).toBe(jwt('new', 1));
+    expect(w.ended).toEqual([]);
+  });
+
+  it('新会话只放内存（恢复码没确认）：旧 logout 不清标记，确认才落盘', async () => {
+    const h = setupAccount();
+    const { call, out } = await loggingOut(h);
+    const p = h.account.login('alice_1', PASSWORD);
+    await flush();
+    h.http
+      .last(LOGIN)
+      .respond(
+        200,
+        authBody({ sid: 'new', gen: 1, accessExpiresAt: h.clock.now() + DAY, recoveryCode: 'RC', recoveryCodeGen: 3 }),
+      );
+    await p;
+    call.respond(200, {});
+    await out;
+    await flush();
+    expect(h.account.session?.accessToken).toBe(jwt('new', 1));
+    expect(h.store.saved).toBeNull();
+    const ack = h.account.ackRecoveryCode(3);
+    await flush();
+    h.http.last(ACK).respond(200, {});
+    await ack;
+    await flush();
+    expect(h.store.saved?.accessToken).toBe(jwt('new', 1));
+  });
+
+  it('logout 进行中登录失败：旧会话照常结束', async () => {
+    const h = setupAccount();
+    const w = watch(h);
+    const { call, out } = await loggingOut(h);
+    const p = h.account.login('alice_1', 'wrong-password');
+    await flush();
+    h.http.last(LOGIN).respondError(401, 4018);
+    await expect(p).rejects.toMatchObject({ code: 4018 });
+    call.respond(200, {});
+    await out;
+    await flush();
+    expect(h.account.session).toBeNull();
+    expect(h.store.saved).toBeNull();
+    expect(w.ended).toEqual([{ action: 'logout' }]);
+  });
+
+  it('登录先发、logout 后发：响应不采用，退出优先', async () => {
+    const h = setupAccount();
+    const w = watch(h);
+    h.session(1, DAY, 'old');
+    await h.online();
+    const p = h.account.login('alice_1', PASSWORD);
+    await flush();
+    const out = h.account.logout();
+    await flush();
+    h.http.last(LOGIN).respond(200, authBody({ sid: 'new', gen: 1, accessExpiresAt: h.clock.now() + DAY }));
+    await expect(p).rejects.toBeInstanceOf(SessionEndedError);
+    h.http.last(LOGOUT).respond(200, {});
+    await out;
+    await flush();
+    expect(h.account.session).toBeNull();
+    expect(h.store.saved).toBeNull();
+    expect(w.ended).toEqual([{ action: 'logout' }]);
+  });
+
+  it('两次 logout 各管各的：新会话的 logout 结束新会话，旧的晚到不再有 ended', async () => {
+    const h = setupAccount();
+    const w = watch(h);
+    const { call: first, out: out1 } = await loggingOut(h);
+    await loginAgain(h);
+    const out2 = h.account.logout();
+    await flush();
+    const second = h.http.last(LOGOUT);
+    expect(second).not.toBe(first);
+    expect(second.json).toEqual({ refreshToken: refreshToken('new', 1) });
+    second.respond(200, {});
+    await out2;
+    await flush();
+    expect(h.account.session).toBeNull();
+    expect(w.ended).toEqual([{ action: 'logout' }]);
+    first.respond(200, {});
+    await out1;
+    await flush();
+    expect(w.ended).toEqual([{ action: 'logout' }]);
+  });
+
+  it('旧 logout 还没回时再次登录，第三个会话不受前两个影响', async () => {
+    const h = setupAccount();
+    const w = watch(h);
+    const { call: first, out: out1 } = await loggingOut(h);
+    await loginAgain(h);
+    const out2 = h.account.logout();
+    await flush();
+    const second = h.http.last(LOGOUT);
+    await loginAgain(h, 'third');
+    first.respond(200, {});
+    second.respond(200, {});
+    await Promise.all([out1, out2]);
+    await flush();
+    expect(h.account.session?.accessToken).toBe(jwt('third', 1));
+    expect(h.store.saved?.accessToken).toBe(jwt('third', 1));
+    expect(w.ended).toEqual([]);
+  });
+
+  it('旧连接的踢线在等 logout 时缓存，新会话建立后作废；新会话自己的踢线立即生效', async () => {
+    const h = setupAccount();
+    const w = watch(h);
+    const { c, call, out } = await loggingOut(h);
+    c.receive({ cmd: 'event', data: { type: 'kicked', reason: 'sessionRevoked' } });
+    c.drop(4012);
+    await flush();
+    await loginAgain(h);
+    expect(h.account.session?.accessToken).toBe(jwt('new', 1));
+    expect(w.fatal).toEqual([]);
+    const c2 = await h.login(USER);
+    c2.receive({ cmd: 'event', data: { type: 'kicked', reason: 'passwordChanged' } });
+    c2.drop(4012);
+    await flush();
+    expect(h.account.session).toBeNull();
+    expect(w.ended).toEqual([expect.objectContaining({ action: 'login', reason: 'passwordChanged' })]);
+    call.respond(200, {});
+    await out;
+    await flush();
+    expect(w.ended).toHaveLength(1);
+  });
+
+  it('演示会话 restore 也算新会话：旧 logout 不结束它', async () => {
+    const h = setupAccount();
+    const w = watch(h);
+    const { call, out } = await loggingOut(h);
+    h.account.restore({ mode: 'demo', userId: USER, accessToken: 'demo-token', accessExpiresAt: h.clock.now() + DAY });
+    call.respond(200, {});
+    await out;
+    await flush();
+    expect(h.account.session?.accessToken).toBe('demo-token');
+    expect(w.ended).toEqual([]);
   });
 });

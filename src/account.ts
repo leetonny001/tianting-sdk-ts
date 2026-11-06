@@ -216,11 +216,14 @@ export class AccountClient extends Emitter<AccountClientEvents> {
   private queue: Array<() => void> = [];
   private refreshQueued = false;
   private epoch = 0; // 每次会话结束加一：进行中的操作回来时，响应不能把已经退出的会话救回来
+  private sessionSeq = 0; // 每个新会话（登录、注册、找回、restore）加一：logout 只收尾它开始时的那个会话（问题 A1）
+  private logoutSeq = 0; // 每次 logout 加一：logout 之前发出的登录，响应不再采用（退出优先）
   private lastEnd: SessionEnd | null = null; // 最近一次结束的原因；有新会话时清除（问题 K7）
   private storeTail: Promise<unknown> = Promise.resolve(); // 存储按顺序执行，结束时的清除不会被更早的保存超过
 
   private holdDepth = 0; // 换 sid 的操作进行中（F-ACC-04 规则 3）
   private heldKicks: Array<{ info: KickInfo; resolve: (d: KickDecision) => void }> = [];
+  private readonly logoutHolds = new Set<object>(); // 进行中的 logout 占的 holdDepth：新会话建立时一起放掉
 
   private waiters: TokenWaiter[] = [];
   private connected = false;
@@ -283,12 +286,15 @@ export class AccountClient extends Emitter<AccountClientEvents> {
 
   /** 恢复一个已有的会话，不写 store，不发 tokens。没有 mode 的老数据按 demo（R-CF-11）。 */
   restore(saved: AccountSession): void {
+    const isNew = saved.accessToken !== this.session_?.accessToken;
+    if (isNew) this.sessionSeq += 1;
     this.session_ = { ...saved, mode: saved.mode ?? 'demo' };
     this.lineage = lineageOf(saved.accessToken);
     this.shortOnArrival = false;
     this.lastEnd = null;
     this.resetFailures();
     this.armLifeTimer();
+    if (isNew) this.releaseLogoutHolds();
   }
 
   /** 回到前台。 */
@@ -700,6 +706,16 @@ export class AccountClient extends Emitter<AccountClientEvents> {
     }
   }
 
+  /** 新会话建立了：进行中的 logout 只关旧会话的事。旧连接已经随"token 换了"断开，它缓存的踢线作废，新会话的踢线不再等它。 */
+  private releaseLogoutHolds(): void {
+    this.holdDepth -= this.logoutHolds.size;
+    this.logoutHolds.clear();
+    if (this.holdDepth > 0) return;
+    const held = this.heldKicks;
+    this.heldKicks = [];
+    for (const { resolve } of held) resolve('ignore');
+  }
+
   // ---- 串行队列（RS4-03） ----
 
   /** 排进串行队列。hold：进行中缓存踢线。 */
@@ -738,6 +754,19 @@ export class AccountClient extends Emitter<AccountClientEvents> {
       this.refreshQueued = false;
       if (this.retryTimer === null) this.trigger('timer'); // 正在等重试时不提前，到点的定时器会发
     }
+  }
+
+  /** 登录、注册、找回：建立新会话。logout 进行中也可以用，它结束时不碰这个新会话（问题 A1）。 */
+  private enqueueNewSession(path: string, body: unknown, hold = false): Promise<AuthResult> {
+    const logouts = this.logoutSeq;
+    return this.enqueue(async () => {
+      const resp = parseAuthResponse(await this.send('POST', path, body));
+      if (logouts !== this.logoutSeq) throw new SessionEndedError(); // 先发的登录，之后点了退出：退出优先
+      this.sessionSeq += 1;
+      const result = await this.applyAuth(resp);
+      this.releaseLogoutHolds();
+      return result;
+    }, hold);
   }
 
   /** 换 sid 的操作。等响应期间退出了就不用这个响应（F-ACC-04 规则 1：退出优先）。 */
@@ -786,35 +815,18 @@ export class AccountClient extends Emitter<AccountClientEvents> {
   }
 
   register(input: { username: string; password: string; nickname?: string; inviteCode?: string }): Promise<AuthResult> {
-    return this.enqueue(async () =>
-      this.applyAuth(
-        parseAuthResponse(await this.send('POST', '/v1/account/register', { ...input, ...this.deviceFields() })),
-      ),
-    );
+    return this.enqueueNewSession('/v1/account/register', { ...input, ...this.deviceFields() });
   }
 
   login(username: string, password: string): Promise<AuthResult> {
-    return this.enqueue(async () =>
-      this.applyAuth(
-        parseAuthResponse(await this.send('POST', '/v1/account/login', { username, password, ...this.deviceFields() })),
-      ),
-    );
+    return this.enqueueNewSession('/v1/account/login', { username, password, ...this.deviceFields() });
   }
 
   /** 找回（F-ACC-05）。成功后换 sid，响应带新恢复码。 */
   recover(username: string, recoveryCode: string, newPassword: string): Promise<AuthResult> {
-    return this.enqueue(
-      async () =>
-        this.applyAuth(
-          parseAuthResponse(
-            await this.send('POST', '/v1/account/recover', {
-              username,
-              recoveryCode,
-              newPassword,
-              ...this.deviceFields(),
-            }),
-          ),
-        ),
+    return this.enqueueNewSession(
+      '/v1/account/recover',
+      { username, recoveryCode, newPassword, ...this.deviceFields() },
       true,
     );
   }
@@ -841,14 +853,19 @@ export class AccountClient extends Emitter<AccountClientEvents> {
   /**
    * 退出（F-ACC-04 规则 1）：先通知服务端，再清本地；连不上也本地退出。resolve 的值表示服务端确认了。
    * 进行中的刷新作废，排队的操作失败。H5 的"待退出"不适用（FE-610 第 6 条）；原生端在 FE-611、FE-612 实现。
+   * 只收尾开始时的那个会话：等响应期间登录成功的新会话不受影响，也没有 ended（问题 A1）。
    */
   async logout(): Promise<boolean> {
     const s = this.session_;
     if (!s) return true;
     this.epoch += 1; // 等 logout 响应时回来的响应不能再采用
+    this.logoutSeq += 1;
+    const seq = this.sessionSeq;
     this.abandonRefresh();
     let confirmed = s.mode !== 'account';
     if (s.mode === 'account') {
+      const hold = {};
+      this.logoutHolds.add(hold);
       this.holdDepth += 1;
       try {
         await this.send('POST', '/v1/account/logout', { refreshToken: s.refreshToken }, { bearer: s.accessToken });
@@ -856,9 +873,9 @@ export class AccountClient extends Emitter<AccountClientEvents> {
       } catch (err) {
         this.log.warn(`account: logout not confirmed: ${errName(err)}`);
       }
-      this.holdDepth -= 1;
+      if (this.logoutHolds.delete(hold)) this.holdDepth -= 1;
     }
-    this.endSession({ action: 'logout' });
+    if (seq === this.sessionSeq) this.endSession({ action: 'logout' });
     await this.storeTail; // 返回时 token 已经不在存储里
     return confirmed;
   }
