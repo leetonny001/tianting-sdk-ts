@@ -467,7 +467,7 @@
     "POST /v1/account/recovery-code": {
       "auth": "bearer+sid",
       "request": "PasswordOnlyRequest",
-      "response": "AuthResponse",
+      "response": "RecoveryCodeResponse",
       "task": "BE-418"
     },
     "POST /v1/account/recovery-code/ack": {
