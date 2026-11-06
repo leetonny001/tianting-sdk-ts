@@ -542,8 +542,9 @@ describe('TC-ACC-03-41 superseded（AC-ACC-03-39）', () => {
     await flush();
     h.clock.advance(1_000);
     await flush();
-    h.http.last(REFRESH).respond(200, authBody({ gen: 2, accessExpiresAt: h.clock.now() + HOUR }));
+    h.http.last(REFRESH).respond(200, authBody({ gen: 2, accessExpiresAt: h.clock.now() + DAY }));
     await flush();
+    h.clock.advance(18 * HOUR + 1); // 刷新回来就不足 6 小时的 token 不再主动刷新（问题 S1）
     h.account.foreground();
     for (let i = 0; i < 2; i++) {
       superseded();

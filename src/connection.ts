@@ -1,9 +1,16 @@
+import { lineageOf } from './account-policy.js';
 import type { Clock, TimerHandle } from './clock.js';
 import { Emitter } from './emitter.js';
 import { CLOSE_RECONNECT, IMError, KICK_CLOSE_CODE } from './errors.js';
 import type { Logger } from './logger.js';
 import type { AuthAck, InboundFrame, Platform } from './protocol.js';
-import type { KickDecision, KickInfo, SessionEnd, TokenProvider } from './token-provider.js';
+import {
+  SessionEndedError,
+  type KickDecision,
+  type KickInfo,
+  type SessionEnd,
+  type TokenProvider,
+} from './token-provider.js';
 import type { Transport, TransportConnection } from './transport.js';
 
 export type ConnState = 'disconnected' | 'connecting' | 'connected';
@@ -16,7 +23,7 @@ export type FatalReason =
    */
   | { kind: 'kicked'; reason: string; code: number; until?: number | null; recoverBefore?: number }
   | { kind: 'closed'; code: number; reason: string }
-  /** 账号会话结束（connect(tokenProvider)）：刷新得到 4019，或者 access 到达绝对上限。 */
+  /** 账号会话结束（connect(tokenProvider)）：刷新得到 4019，access 到达绝对上限，或者连接时会话已经结束（问题 K7）。 */
   | ({ kind: 'session' } & Omit<SessionEnd, 'origin'>);
 
 export interface ConnectionOptions {
@@ -222,15 +229,28 @@ export class Connection extends Emitter<ConnEvents> {
       this.openSocket(gen);
       return;
     }
-    // 启动已过期时这里会先刷新（规则 5）。会话结束时不用在这里处理：IMClient 从 onEnded 收到。
+    // 启动已过期时这里会先刷新（规则 5）。等的时候会话才结束：IMClient 从 onEnded 收到，已经 stop，这里什么都不做。
     provider.accessToken().then(
       (token) => {
         if (gen !== this.connGen || !this.active) return;
         this.token = token;
         this.openSocket(gen);
       },
-      () => this.o.logger.debug('im: no token, session ended'),
+      (err: unknown) => {
+        this.o.logger.debug('im: no token, session ended');
+        if (gen === this.connGen && this.active && this.provider === provider) this.emitNoSession(err);
+      },
     );
+  }
+
+  /** 连接时会话已经结束（问题 K7）：不会有 onEnded 了，不能停在连接中。 */
+  private emitNoSession(err: unknown): void {
+    const end: SessionEnd = (err instanceof SessionEndedError ? err.end : undefined) ?? { action: 'login' };
+    const fatal: FatalReason = { kind: 'session', ...end };
+    delete (fatal as { origin?: unknown }).origin;
+    this.active = false;
+    this.setState('disconnected');
+    this.emit('fatal', fatal);
   }
 
   private openSocket(gen: number): void {
@@ -387,6 +407,7 @@ export class Connection extends Emitter<ConnEvents> {
       reason: known ? kicked : null,
       code,
       ...(recoverBefore !== undefined ? { recoverBefore } : {}),
+      sid: lineageOf(this.token).sid,
     };
     const apply = (d: KickDecision) => {
       if (!this.active || this.provider !== provider) return;

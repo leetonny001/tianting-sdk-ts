@@ -61,10 +61,21 @@ export class MemoryStore implements SessionStore {
   clears = 0;
   /** 让下一次 save 失败。 */
   failSave = false;
+  /** 设置后 save 等它再写（可以挂起的存储）。 */
+  saveGate: Promise<void> | null = null;
   load(): AccountSession | null {
     return this.saved;
   }
-  save(s: AccountSession): void {
+  save(s: AccountSession): void | Promise<void> {
+    const gate = this.saveGate;
+    if (gate) {
+      return gate.then(() => {
+        this.write(s);
+      });
+    }
+    this.write(s);
+  }
+  private write(s: AccountSession): void {
     if (this.failSave) throw new Error('disk full');
     this.saved = s;
     this.saves.push(s);

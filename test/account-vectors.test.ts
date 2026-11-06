@@ -161,7 +161,7 @@ describe('TC-CHAT-90-13 account-session.json serverCases（规则 4，约束假�
       const gen = genOf(String(call.json['refreshToken']));
       const r = srv.refresh(gen);
       expect(r.result).toMatch(/^issued/);
-      call.respond(200, authBody({ gen: r.newGen!, accessExpiresAt: h.clock.now() + 5 * 3_600_000 }));
+      call.respond(200, authBody({ gen: r.newGen!, accessExpiresAt: h.clock.now() + 24 * 3_600_000 }));
     };
     const authed = async () => {
       await flush();
@@ -176,7 +176,7 @@ describe('TC-CHAT-90-13 account-session.json serverCases（规则 4，约束假�
     h.im.connect(h.account.tokenProvider);
     await authed(); // 不足 6 小时：拨号时就开始刷新，换上之后 1000 重连
     for (let round = 0; round < 3; round++) {
-      h.clock.advance(60_000);
+      h.clock.advance(18 * 3_600_000 + 60_000); // 不足 6 小时才刷新；刷新回来就不足的不再主动刷新（问题 S1）
       await flush();
       h.account.foreground();
       await authed();

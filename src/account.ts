@@ -19,7 +19,15 @@ import { IMError } from './errors.js';
 import { FetchHttpTransport, type HttpRequest, type HttpTransport } from './http.js';
 import { silentLogger, type Logger } from './logger.js';
 import type { Platform } from './protocol.js';
-import type { KickDecision, KickInfo, SessionEnd, TokenProvider } from './token-provider.js';
+import {
+  SessionEndedError,
+  type KickDecision,
+  type KickInfo,
+  type SessionEnd,
+  type TokenProvider,
+} from './token-provider.js';
+
+export { SessionEndedError };
 
 /** 账号接口返回的错误：HTTP 状态 + {code, msg, reason?, details?}。 */
 export class AccountError extends IMError {
@@ -49,14 +57,6 @@ export class AccountTimeoutError extends AccountNetworkError {
   }
 }
 
-/** 没有可用的账号会话：没登录，或者已经结束（ended 事件）。 */
-export class SessionEndedError extends Error {
-  constructor() {
-    super('account session ended');
-    this.name = 'SessionEndedError';
-  }
-}
-
 /** 本地保存的会话。存储由 App 决定（H5 sessionStorage，原生 Keystore、Keychain，F-ACC-03 规则 8）。 */
 export interface AccountSession {
   /** 没有 mode 的老数据按 demo（R-CF-11）。 */
@@ -69,7 +69,7 @@ export interface AccountSession {
   absoluteExpiresAt?: number;
 }
 
-/** 新 token 先写这里再使用（规则 5，R-CF-09）。确认恢复码之前不写（F-ACC-05 规则 1）。 */
+/** 新 token 先写这里再使用（规则 5，R-CF-09）。确认恢复码之前不写（F-ACC-05 规则 1）。可以挂起：SDK 保证调用不重叠、按顺序执行。 */
 export interface SessionStore {
   load(): Promise<AccountSession | null> | AccountSession | null;
   save(session: AccountSession): Promise<void> | void;
@@ -203,6 +203,11 @@ export class AccountClient extends Emitter<AccountClientEvents> {
   private backoffN = 0;
   private mustRefresh = false; // 不看剩余时间也要刷新：token 被拒绝过，或者已经过期
   private retryTimer: TimerHandle | null = null;
+  /**
+   * 刷新刚返回的 token 按本地时钟已经不足 6 小时（时钟偏快，或者 TTL 配得短，问题 S1）。再刷新也是同样的答案，又要重连，
+   * 会一直循环到服务端限流。所以这个 token 不再主动刷新，也不按本地时间当成过期，等服务端的 4011（规则 7）。
+   */
+  private shortOnArrival = false;
   private rereadStore = false; // superseded 之后重读本地最新 token（规则 6）
   private lastFailure: Error | null = null;
 
@@ -210,6 +215,8 @@ export class AccountClient extends Emitter<AccountClientEvents> {
   private queue: Array<() => void> = [];
   private refreshQueued = false;
   private epoch = 0; // 每次会话结束加一：进行中的操作回来时，响应不能把已经退出的会话救回来
+  private lastEnd: SessionEnd | null = null; // 最近一次结束的原因；有新会话时清除（问题 K7）
+  private storeTail: Promise<unknown> = Promise.resolve(); // 存储按顺序执行，结束时的清除不会被更早的保存超过
 
   private holdDepth = 0; // 换 sid 的操作进行中（F-ACC-04 规则 3）
   private heldKicks: Array<{ info: KickInfo; resolve: (d: KickDecision) => void }> = [];
@@ -267,7 +274,7 @@ export class AccountClient extends Emitter<AccountClientEvents> {
 
   /** 启动：从 store 读会话，检查是否要刷新。已过期的先刷新，连接时 accessToken() 会等它。 */
   async start(): Promise<Readonly<AccountSession> | null> {
-    const saved = await this.store?.load();
+    const saved = await this.storeCall((st) => st.load());
     if (saved) this.restore(saved);
     if (this.session_) this.trigger('start');
     return this.session_;
@@ -277,6 +284,8 @@ export class AccountClient extends Emitter<AccountClientEvents> {
   restore(saved: AccountSession): void {
     this.session_ = { ...saved, mode: saved.mode ?? 'demo' };
     this.lineage = lineageOf(saved.accessToken);
+    this.shortOnArrival = false;
+    this.lastEnd = null;
     this.resetFailures();
     this.armLifeTimer();
   }
@@ -328,7 +337,7 @@ export class AccountClient extends Emitter<AccountClientEvents> {
         this.endSession({ action: 'login', dialog: 'sessionExpired', reason: 'expired' });
         return { action: 'login', dialog: 'sessionExpired' };
       }
-      if (!shouldRefresh(s.accessExpiresAt, s.absoluteExpiresAt, now)) return { action: 'none' };
+      if (this.shortOnArrival || !shouldRefresh(s.accessExpiresAt, s.absoluteExpiresAt, now)) return { action: 'none' };
     }
     if (this.slotBusy) {
       this.refreshQueued = true;
@@ -387,7 +396,7 @@ export class AccountClient extends Emitter<AccountClientEvents> {
     }
     const next = this.sessionFrom(resp);
     try {
-      if (!this.memoryOnly) await this.store?.save(next); // 新 token 先落盘再使用
+      if (!this.memoryOnly) await this.storeCall((st) => st.save(next)); // 新 token 先落盘再使用
     } catch (err) {
       this.log.warn(`account: session save failed: ${errName(err)}`);
       this.onRefreshFailed(attempt, new AccountNetworkError('session save failed'));
@@ -398,7 +407,7 @@ export class AccountClient extends Emitter<AccountClientEvents> {
     this.backoffN = 0;
     this.lastFailure = null;
     this.settleRefresh(attempt, 'ok');
-    this.adopt(next, resp);
+    this.adopt(next, resp, true);
     this.record({ action: 'keepToken' });
   }
 
@@ -462,13 +471,14 @@ export class AccountClient extends Emitter<AccountClientEvents> {
 
   private async reloadFromStore(): Promise<void> {
     try {
-      const latest = await this.store?.load();
+      const latest = await this.storeCall((st) => st.load());
       const s = this.session_;
       if (!latest?.refreshToken || !s || latest.userId !== s.userId || latest.refreshToken === s.refreshToken) return;
       const l = lineageOf(latest.accessToken);
       if (isLocalNewer(l, this.lineage)) {
         this.session_ = { ...latest, mode: 'account' };
         this.lineage = l;
+        this.shortOnArrival = false;
       }
     } catch (err) {
       this.log.warn(`account: session load failed: ${errName(err)}`);
@@ -517,9 +527,11 @@ export class AccountClient extends Emitter<AccountClientEvents> {
     };
   }
 
-  private adopt(next: AccountSession, resp: AuthResponse): void {
+  private adopt(next: AccountSession, resp: AuthResponse, fromRefresh = false): void {
     this.session_ = next;
     this.lineage = lineageOf(next.accessToken);
+    this.lastEnd = null;
+    this.shortOnArrival = fromRefresh && shouldRefresh(next.accessExpiresAt, next.absoluteExpiresAt, this.clock.now());
     this.mustRefresh = false;
     this.clearRetryTimer();
     this.armLifeTimer();
@@ -531,14 +543,20 @@ export class AccountClient extends Emitter<AccountClientEvents> {
 
   /** 登录、注册、改密、找回、退出其他设备的响应。没有恢复码才落盘；有恢复码时清掉旧的，确认之后才写（F-ACC-05 规则 1）。 */
   private async applyAuth(resp: AuthResponse, keepMemoryOnly = false): Promise<AuthResult> {
+    const epoch = this.epoch;
     const next = this.sessionFrom(resp);
     this.memoryOnly = !!resp.recoveryCode || (keepMemoryOnly && this.memoryOnly);
     try {
-      if (this.memoryOnly) await this.store?.clear();
-      else await this.store?.save(next);
+      if (this.memoryOnly) await this.storeCall((st) => st.clear());
+      else await this.storeCall((st) => st.save(next));
     } catch (err) {
       // 服务端已经换了凭证，旧 token 回不去了：继续用新的，下一次换 token 时再写。
       this.log.warn(`account: session save failed: ${errName(err)}`);
+    }
+    if (epoch !== this.epoch) {
+      // 落盘期间退出或被踢了：这份不能留，也不能把结束的会话救回来（问题 S3，F-ACC-04 规则 1：退出优先）。
+      await this.clearStore();
+      throw new SessionEndedError();
     }
     this.resetFailures();
     this.adopt(next, resp);
@@ -554,7 +572,7 @@ export class AccountClient extends Emitter<AccountClientEvents> {
     if (this.lifeTimer !== null) this.clock.clearTimeout(this.lifeTimer);
     this.lifeTimer = null;
     const s = this.session_;
-    if (!s || s.mode !== 'account' || !this.connected) return;
+    if (!s || s.mode !== 'account' || !this.connected || this.shortOnArrival) return;
     const now = this.clock.now();
     const final = s.accessExpiresAt === s.absoluteExpiresAt;
     // 剩余恰好 6 小时不刷新，所以要过这个点 1 毫秒。
@@ -582,8 +600,8 @@ export class AccountClient extends Emitter<AccountClientEvents> {
 
   private async accessToken(): Promise<string> {
     const s = this.session_;
-    if (!s) throw new SessionEndedError();
-    if (s.mode === 'account' && this.clock.now() >= s.accessExpiresAt) {
+    if (!s) throw new SessionEndedError(this.lastEnd ?? undefined);
+    if (s.mode === 'account' && !this.shortOnArrival && this.clock.now() >= s.accessExpiresAt) {
       if (s.accessExpiresAt === s.absoluteExpiresAt) {
         this.endSession({ action: 'login', dialog: 'sessionExpired', reason: 'expired' });
         throw new SessionEndedError();
@@ -638,6 +656,11 @@ export class AccountClient extends Emitter<AccountClientEvents> {
   // ---- 踢线（F-ACC-04 规则 3，RS5-15） ----
 
   private kickReceived(info: KickInfo): KickDecision | Promise<KickDecision> {
+    // 旧 sid 的踢线（问题 K5）：拨号读到旧 token、还没开连接时换了 sid，那条连接没有被"token 换了"断开。
+    if (info.sid && this.session_ && info.sid !== this.lineage.sid) {
+      this.log.debug('account: kick of an old sid ignored');
+      return 'ignore';
+    }
     if (this.holdDepth > 0 && kickIsHoldable(info.reason, info.code)) {
       this.log.debug('account: kick held while credentials are changing');
       return new Promise((resolve) => this.heldKicks.push({ info, resolve }));
@@ -727,7 +750,7 @@ export class AccountClient extends Emitter<AccountClientEvents> {
     for (let i = 0; ; i++) {
       const s = this.session_;
       if (!s) throw new SessionEndedError();
-      if (this.clock.now() >= s.accessExpiresAt) await this.refreshInSlot();
+      if (!this.shortOnArrival && this.clock.now() >= s.accessExpiresAt) await this.refreshInSlot();
       const token = this.session_?.accessToken;
       if (!token) throw new SessionEndedError();
       try {
@@ -819,6 +842,7 @@ export class AccountClient extends Emitter<AccountClientEvents> {
   async logout(): Promise<boolean> {
     const s = this.session_;
     if (!s) return true;
+    this.epoch += 1; // 等 logout 响应时回来的响应不能再采用
     this.abandonRefresh();
     let confirmed = s.mode !== 'account';
     if (s.mode === 'account') {
@@ -832,6 +856,7 @@ export class AccountClient extends Emitter<AccountClientEvents> {
       this.holdDepth -= 1;
     }
     this.endSession({ action: 'logout' });
+    await this.storeTail; // 返回时 token 已经不在存储里
     return confirmed;
   }
 
@@ -853,9 +878,16 @@ export class AccountClient extends Emitter<AccountClientEvents> {
       }
       throw err;
     }
-    if (this.memoryOnly && this.session_) {
-      this.memoryOnly = false;
-      await this.store?.save(this.session_);
+    if (!this.memoryOnly) return;
+    // 写到"存的就是在用的"才清标记：写的时候刷新还是只放内存，写失败抛给调用方，再调一次能重写（问题 S3）。
+    // 写的时候会话结束：存储按顺序执行，结束时的清除排在这次写入后面，所以不用再清。
+    while (this.session_) {
+      const s = this.session_;
+      await this.storeCall((st) => st.save(s));
+      if (s === this.session_) {
+        this.memoryOnly = false;
+        return;
+      }
     }
   }
 
@@ -1014,6 +1046,8 @@ export class AccountClient extends Emitter<AccountClientEvents> {
     this.epoch += 1;
     this.session_ = null;
     this.memoryOnly = false;
+    this.shortOnArrival = false;
+    this.lastEnd = stripUndefined(e);
     this.abandonRefresh();
     this.resetFailures();
     this.refreshQueued = false;
@@ -1035,9 +1069,18 @@ export class AccountClient extends Emitter<AccountClientEvents> {
     this.emit('ended', end);
   }
 
+  /** 存储调用一个接一个：可以挂起的存储上，先发起的先落地。 */
+  private storeCall<T>(op: (store: SessionStore) => Promise<T> | T): Promise<T | undefined> {
+    const store = this.store;
+    if (!store) return Promise.resolve(undefined);
+    const run = this.storeTail.then(() => op(store));
+    this.storeTail = run.catch(() => undefined);
+    return run;
+  }
+
   private async clearStore(): Promise<void> {
     try {
-      await this.store?.clear();
+      await this.storeCall((st) => st.clear());
     } catch (err) {
       this.log.warn(`account: session clear failed: ${errName(err)}`);
     }
