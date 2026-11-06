@@ -196,6 +196,7 @@ export class AccountClient extends Emitter<AccountClientEvents> {
   private session_: AccountSession | null = null;
   private lineage: TokenLineage = { sid: '', gen: 0 };
   private memoryOnly = false; // 恢复码确认之前 token 只放内存（F-ACC-05 规则 1）
+  private unackedGen: number | null = null; // 只放内存时，等确认的是哪一代恢复码：确认别的代不算
 
   private attempt = 0;
   private inflight: Inflight | null = null;
@@ -546,6 +547,8 @@ export class AccountClient extends Emitter<AccountClientEvents> {
     const epoch = this.epoch;
     const next = this.sessionFrom(resp);
     this.memoryOnly = !!resp.recoveryCode || (keepMemoryOnly && this.memoryOnly);
+    if (resp.recoveryCode) this.unackedGen = resp.recoveryCodeGen ?? null;
+    else if (!this.memoryOnly) this.unackedGen = null;
     try {
       if (this.memoryOnly) await this.storeCall((st) => st.clear());
       else await this.storeCall((st) => st.save(next));
@@ -861,8 +864,15 @@ export class AccountClient extends Emitter<AccountClientEvents> {
   }
 
   /** 重新生成恢复码（F-ACC-05 规则 5）。token 不变。 */
-  regenerateRecoveryCode(password: string): Promise<{ recoveryCode: string; recoveryCodeGen: number }> {
-    return this.authed('POST', '/v1/account/recovery-code', { password });
+  async regenerateRecoveryCode(password: string): Promise<{ recoveryCode: string; recoveryCodeGen: number }> {
+    const r = await this.authed<{ recoveryCode: string; recoveryCodeGen: number }>(
+      'POST',
+      '/v1/account/recovery-code',
+      { password },
+    );
+    // 还只放内存时要确认的就是这一代。响应可能比之后的改密晚到：代号只进不退。
+    if (this.memoryOnly) this.unackedGen = Math.max(this.unackedGen ?? 0, r.recoveryCodeGen);
+    return r;
   }
 
   /**
@@ -878,14 +888,15 @@ export class AccountClient extends Emitter<AccountClientEvents> {
       }
       throw err;
     }
-    if (!this.memoryOnly) return;
+    // 确认的是旧的一代（确认进行中改密、找回或重新生成换了代）：这一代的新 token 还不能落盘（RS5-13）。
     // 写到"存的就是在用的"才清标记：写的时候刷新还是只放内存，写失败抛给调用方，再调一次能重写（问题 S3）。
     // 写的时候会话结束：存储按顺序执行，结束时的清除排在这次写入后面，所以不用再清。
-    while (this.session_) {
+    while (this.session_ && this.memoryOnly && gen === this.unackedGen) {
       const s = this.session_;
       await this.storeCall((st) => st.save(s));
-      if (s === this.session_) {
+      if (s === this.session_ && gen === this.unackedGen) {
         this.memoryOnly = false;
+        this.unackedGen = null;
         return;
       }
     }
@@ -1046,6 +1057,7 @@ export class AccountClient extends Emitter<AccountClientEvents> {
     this.epoch += 1;
     this.session_ = null;
     this.memoryOnly = false;
+    this.unackedGen = null;
     this.shortOnArrival = false;
     this.lastEnd = stripUndefined(e);
     this.abandonRefresh();

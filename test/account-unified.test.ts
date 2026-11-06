@@ -581,3 +581,175 @@ describe('K5 旧 sid 的踢线', () => {
     expect(h.account.session).toBeNull();
   });
 });
+
+describe('恢复码确认和换代交错：ack 只对当前未确认的那一代生效（F-ACC-05 规则 1，RS5-13）', () => {
+  const REGEN = '/v1/account/recovery-code';
+  const RECOVER = '/v1/account/recover';
+  const LOGOUT_OTHERS = '/v1/account/logout-others';
+
+  /** 改密拿到第 2 代恢复码，没有确认。 */
+  async function unackedGen2(h: AccountHarness) {
+    h.session(1, DAY);
+    const change = h.account.changePassword('Password-1', 'Password-2');
+    await flush();
+    h.http.last(PASSWORD).respond(200, withCode(h, 'sid2', 2));
+    await change;
+    expect(h.store.saved).toBeNull();
+  }
+
+  function withCode(h: AccountHarness, sid: string, code: number) {
+    return authBody({
+      sid,
+      gen: 1,
+      accessExpiresAt: h.clock.now() + DAY,
+      recoveryCode: `CODE-${code}`,
+      recoveryCodeGen: code,
+    });
+  }
+
+  /** 还只放内存：刷新不落盘。 */
+  async function stillMemoryOnly(h: AccountHarness) {
+    const before = h.account.localGen;
+    h.clock.advance(18 * HOUR + 1);
+    h.account.foreground();
+    await flush();
+    const sid = 'sid' + String(h.http.last(REFRESH).json['refreshToken']).split('.')[1]!.slice(3);
+    h.http.last(REFRESH).respond(200, authBody({ sid, gen: before + 1, accessExpiresAt: h.clock.now() + DAY }));
+    await flush();
+    expect(h.account.localGen).toBe(before + 1);
+    expect(h.store.saved).toBeNull();
+  }
+
+  async function ack(h: AccountHarness, gen: number) {
+    const p = h.account.ackRecoveryCode(gen);
+    await flush();
+    h.http.last(ACK).respond(200);
+    await p;
+    await flush();
+  }
+
+  it('ack(2) 进行中改密拿到第 3 代：第 2 代的响应不让新 token 落盘，确认第 3 代才写', async () => {
+    const h = setupAccount();
+    await unackedGen2(h);
+    const stale = h.account.ackRecoveryCode(2);
+    await flush();
+    const staleCall = h.http.last(ACK);
+    const change = h.account.changePassword('Password-2', 'Password-3');
+    await flush();
+    h.http.last(PASSWORD).respond(200, withCode(h, 'sid3', 3));
+    await change;
+    staleCall.respond(200);
+    await stale;
+    await flush();
+    expect(h.store.saved).toBeNull();
+    await stillMemoryOnly(h);
+    await ack(h, 3);
+    expect(h.store.saved?.accessToken).toBe(jwt('sid3', 2));
+  });
+
+  it('ack(2) 进行中重新生成拿到第 3 代：第 2 代的响应不落盘，确认第 3 代才写', async () => {
+    const h = setupAccount();
+    await unackedGen2(h);
+    const stale = h.account.ackRecoveryCode(2);
+    await flush();
+    const staleCall = h.http.last(ACK);
+    const regen = h.account.regenerateRecoveryCode('Password-2');
+    await flush();
+    h.http.last(REGEN).respond(200, { recoveryCode: 'CODE-3', recoveryCodeGen: 3 });
+    await regen;
+    staleCall.respond(200);
+    await stale;
+    await flush();
+    expect(h.store.saved).toBeNull();
+    await stillMemoryOnly(h);
+    await ack(h, 3);
+    expect(h.store.saved?.accessToken).toBe(jwt('sid2', 2));
+  });
+
+  it('ack(2) 进行中找回拿到第 3 代：第 2 代的响应不落盘，确认第 3 代才写', async () => {
+    const h = setupAccount();
+    await unackedGen2(h);
+    const stale = h.account.ackRecoveryCode(2);
+    await flush();
+    const staleCall = h.http.last(ACK);
+    const recover = h.account.recover(USER, 'CODE-2', 'Password-3');
+    await flush();
+    h.http.last(RECOVER).respond(200, withCode(h, 'sid3', 3));
+    await recover;
+    staleCall.respond(200);
+    await stale;
+    await flush();
+    expect(h.store.saved).toBeNull();
+    await stillMemoryOnly(h);
+    await ack(h, 3);
+    expect(h.store.saved?.accessToken).toBe(jwt('sid3', 2));
+  });
+
+  it('ack(2) 正在写存储时改密拿到第 3 代：写的旧值被清掉，标记保持', async () => {
+    const h = setupAccount();
+    await unackedGen2(h);
+    const gate = deferred();
+    h.store.saveGate = gate.promise;
+    const stale = h.account.ackRecoveryCode(2);
+    await flush();
+    h.http.last(ACK).respond(200);
+    await flush();
+    const change = h.account.changePassword('Password-2', 'Password-3');
+    await flush();
+    h.http.last(PASSWORD).respond(200, withCode(h, 'sid3', 3));
+    await flush();
+    h.store.saveGate = null;
+    gate.resolve();
+    await stale;
+    await change;
+    await flush();
+    expect(h.account.session?.accessToken).toBe(jwt('sid3', 1));
+    expect(h.store.saved).toBeNull();
+    await stillMemoryOnly(h);
+  });
+
+  it('重新生成的响应比改密晚到：代号不倒退，确认最新一代才写', async () => {
+    const h = setupAccount();
+    await unackedGen2(h);
+    const regen = h.account.regenerateRecoveryCode('Password-2');
+    await flush();
+    const regenCall = h.http.last(REGEN);
+    const change = h.account.changePassword('Password-2', 'Password-3');
+    await flush();
+    h.http.last(PASSWORD).respond(200, withCode(h, 'sid3', 4));
+    await change;
+    regenCall.respond(200, { recoveryCode: 'CODE-3', recoveryCodeGen: 3 });
+    await regen;
+    await ack(h, 4);
+    expect(h.store.saved?.accessToken).toBe(jwt('sid3', 1));
+  });
+
+  it('退出其他设备不换恢复码：代号留着，确认这一代还能写', async () => {
+    const h = setupAccount();
+    await unackedGen2(h);
+    const others = h.account.logoutOthers('Password-2');
+    await flush();
+    h.http.last(LOGOUT_OTHERS).respond(200, authBody({ sid: 'sid3', gen: 1, accessExpiresAt: h.clock.now() + DAY }));
+    await others;
+    expect(h.store.saved).toBeNull();
+    await ack(h, 2);
+    expect(h.store.saved?.accessToken).toBe(jwt('sid3', 1));
+  });
+
+  it('确认过之后：刷新正常落盘，重新生成不让 token 回到只放内存', async () => {
+    const h = setupAccount();
+    await unackedGen2(h);
+    await ack(h, 2);
+    const regen = h.account.regenerateRecoveryCode('Password-2');
+    await flush();
+    h.http.last(REGEN).respond(200, { recoveryCode: 'CODE-3', recoveryCodeGen: 3 });
+    await regen;
+    await ack(h, 3);
+    h.clock.advance(18 * HOUR + 1);
+    h.account.foreground();
+    await flush();
+    h.http.last(REFRESH).respond(200, authBody({ sid: 'sid2', gen: 2, accessExpiresAt: h.clock.now() + DAY }));
+    await flush();
+    expect(h.store.saved?.accessToken).toBe(jwt('sid2', 2));
+  });
+});
