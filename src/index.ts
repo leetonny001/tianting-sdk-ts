@@ -4,8 +4,31 @@ export {
   type ApplyFriendOptions,
   type IMClientOptions,
   type IMClientTimings,
+  type SecurityNotice,
   type SendResult,
 } from './client.js';
+export {
+  AccountClient,
+  AccountError,
+  AccountNetworkError,
+  AccountTimeoutError,
+  SessionEndedError,
+  type AccountClientOptions,
+  type AccountConfig,
+  type AccountEvents,
+  type AccountSession,
+  type AuthResult,
+  type SessionStore,
+} from './account.js';
+export {
+  isLocalNewer,
+  lineageOf,
+  sessionDialogText,
+  type RefreshSource,
+  type SessionDialog,
+  type SessionOutcome,
+} from './account-policy.js';
+export type { KickDecision, KickInfo, SessionEnd, TokenProvider } from './token-provider.js';
 export {
   REQUEST_RETENTION_MS,
   SocialState,

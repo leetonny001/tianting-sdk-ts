@@ -88,10 +88,13 @@ export interface AuthAck {
   serverTime: number;
   /** 用户级禁言时才有，永久为 null（第二批）。 */
   mutedUntil?: number | null;
+  /** 账号最新一代恢复码没有确认时才有（PRD-chat F-ACC-05 规则 1）：App 要强制进保存页。 */
+  recoveryCodeUnacked?: boolean;
 }
 
 export type ServerEvent =
   | { type: 'kicked'; reason: string; until?: number | null; recoverBefore?: number }
+  | { type: 'securityNotice'; kind: string; at: number; platform: Platform }
   | { type: 'msgDeleted'; convId: string; msgIds: string[]; seqs: number[] }
   | { type: 'muted'; scope: string; groupId?: string; mutedUntil: number | null }
   | { type: 'unmuted'; scope: string; groupId?: string }

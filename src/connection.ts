@@ -3,6 +3,7 @@ import { Emitter } from './emitter.js';
 import { CLOSE_RECONNECT, IMError, KICK_CLOSE_CODE } from './errors.js';
 import type { Logger } from './logger.js';
 import type { AuthAck, InboundFrame, Platform } from './protocol.js';
+import type { KickDecision, KickInfo, SessionEnd, TokenProvider } from './token-provider.js';
 import type { Transport, TransportConnection } from './transport.js';
 
 export type ConnState = 'disconnected' | 'connecting' | 'connected';
@@ -11,10 +12,12 @@ export type ConnState = 'disconnected' | 'connecting' | 'connected';
 export type FatalReason =
   /**
    * until 只在 reason = suspended 时有：封禁到期时间（毫秒），永久为 null。
-   * recoverBefore：找回截止日期（PRD-chat F-ACC-03 规则 6a）。
+   * recoverBefore：找回截止日期（PRD-chat F-ACC-03 规则 6a），有就提示这个日期，用 sessionDialogText。
    */
   | { kind: 'kicked'; reason: string; code: number; until?: number | null; recoverBefore?: number }
-  | { kind: 'closed'; code: number; reason: string };
+  | { kind: 'closed'; code: number; reason: string }
+  /** 账号会话结束（connect(tokenProvider)）：刷新得到 4019，或者 access 到达绝对上限。 */
+  | ({ kind: 'session' } & Omit<SessionEnd, 'origin'>);
 
 export interface ConnectionOptions {
   /** WebSocket 地址，例如 wss://im.example.com/ws（不要带 token，C-52）。 */
@@ -107,6 +110,9 @@ export class Connection extends Emitter<ConnEvents> {
   private kickedReason: string | null = null;
   private kickedUntil: number | null | undefined;
   private kickedRecoverBefore: number | undefined;
+  private provider: TokenProvider | null = null;
+  private unsubscribeToken: (() => void) | null = null;
+  private rejectStreak = 0; // 连续被 4011 拒绝的次数：第一次立即重连，再来按退避，防止和服务端打转
   private reqN = 0;
   private authId = '';
   private pending = new Map<string, Pending>();
@@ -120,13 +126,40 @@ export class Connection extends Emitter<ConnEvents> {
     return this.stateValue;
   }
 
-  /** 开始连接（已经在连接或已连接时只更新 token）。 */
-  start(token: string): void {
-    this.token = token;
+  /**
+   * 开始连接（已经在连接或已连接时只更新 token）。
+   * 传字符串是演示模式，行为不变；传 TokenProvider 是账号模式（PRD-chat F-ACC-03 规则 5、7）。
+   */
+  start(token: string | TokenProvider): void {
+    this.setProvider(typeof token === 'string' ? null : token);
+    if (typeof token === 'string') this.token = token;
     if (this.active) return;
     this.active = true;
     this.attempt = 0;
+    this.rejectStreak = 0;
     this.dial();
+  }
+
+  private setProvider(p: TokenProvider | null): void {
+    if (p === this.provider) return;
+    this.unsubscribeToken?.();
+    this.provider = p;
+    this.unsubscribeToken = p?.onTokenChanged(() => this.onTokenChanged()) ?? null;
+  }
+
+  /** token 换了（规则 5）：已有连接用 1000 断开，立即用新 token 重连；在等退避的不用等了。 */
+  private onTokenChanged(): void {
+    if (!this.active) return;
+    const conn = this.conn;
+    if (conn) {
+      this.teardown();
+      conn.close(1000, 'token rotated');
+      this.setState('disconnected');
+      this.dial();
+    } else if (this.reconnectTimer !== null) {
+      this.clearReconnect();
+      this.dial();
+    }
   }
 
   /** 主动退出：以 1000 关闭，不再重连（PRD F-AUTH-05）。 */
@@ -137,6 +170,7 @@ export class Connection extends Emitter<ConnEvents> {
     this.teardown();
     conn?.close(1000, 'logout');
     this.setState('disconnected');
+    this.setProvider(null);
   }
 
   /** 网络恢复（浏览器 online 事件）：正在等待退避时立即重连（PRD F-CONN-01 规则 3）。 */
@@ -183,6 +217,23 @@ export class Connection extends Emitter<ConnEvents> {
     this.kickedUntil = undefined;
     this.kickedRecoverBefore = undefined;
     this.setState('connecting');
+    const provider = this.provider;
+    if (!provider) {
+      this.openSocket(gen);
+      return;
+    }
+    // 启动已过期时这里会先刷新（规则 5）。会话结束时不用在这里处理：IMClient 从 onEnded 收到。
+    provider.accessToken().then(
+      (token) => {
+        if (gen !== this.connGen || !this.active) return;
+        this.token = token;
+        this.openSocket(gen);
+      },
+      () => this.o.logger.debug('im: no token, session ended'),
+    );
+  }
+
+  private openSocket(gen: number): void {
     const url = `${this.o.url}?platform=${encodeURIComponent(this.o.platform)}`;
     this.conn = this.o.transport.open(url, {
       onOpen: () => {
@@ -240,6 +291,7 @@ export class Connection extends Emitter<ConnEvents> {
         return; // 凭证问题由服务端随后的 kicked + 关闭码处理
       }
       this.attempt = 0;
+      this.rejectStreak = 0;
       this.setState('connected');
       this.scheduleHeartbeat();
       this.emit('connected', f.data as AuthAck);
@@ -289,16 +341,11 @@ export class Connection extends Emitter<ConnEvents> {
     this.setState('disconnected');
     if (!this.active) return;
 
+    if (this.provider && this.onClosedWithProvider(this.provider, kicked, known, code, until, recoverBefore)) return;
+
     // 被踢不重连（PRD F-AUTH-03 规则 4），例外：服务端下线按退避重连（C-55）。
     if (kicked !== null && kicked !== 'serverShutdown') {
-      this.active = false;
-      this.emit('fatal', {
-        kind: 'kicked',
-        reason: kicked,
-        code,
-        ...(until !== undefined ? { until } : {}),
-        ...(recoverBefore !== undefined ? { recoverBefore } : {}),
-      });
+      this.emitKicked(kicked, code, until, recoverBefore);
       return;
     }
     // 1000、4009～4012、4429 不重连；未列出的关闭码（1006 等）按可以重连处理。
@@ -308,6 +355,68 @@ export class Connection extends Emitter<ConnEvents> {
       return;
     }
     this.scheduleReconnect();
+  }
+
+  private emitKicked(reason: string, code: number, until: number | null | undefined, recoverBefore?: number): void {
+    this.active = false;
+    this.emit('fatal', {
+      kind: 'kicked',
+      reason,
+      code,
+      ...(until !== undefined ? { until } : {}),
+      ...(recoverBefore !== undefined ? { recoverBefore } : {}),
+    });
+  }
+
+  /** 账号模式的关闭：4011 走规则 7；4010、4012 让账号会话决定（改密进行中要缓存，F-ACC-04 规则 3）。返回 true 表示处理完了。 */
+  private onClosedWithProvider(
+    provider: TokenProvider,
+    kicked: string | null,
+    known: boolean,
+    code: number,
+    until: number | null | undefined,
+    recoverBefore: number | undefined,
+  ): boolean {
+    if (kicked === 'tokenExpired' || (!known && code === 4011)) {
+      this.onTokenRejected(provider);
+      return true;
+    }
+    if (kicked === 'serverShutdown') return false;
+    if (!known && code !== 4010 && code !== 4012) return false;
+    const info: KickInfo = {
+      reason: known ? kicked : null,
+      code,
+      ...(recoverBefore !== undefined ? { recoverBefore } : {}),
+    };
+    const apply = (d: KickDecision) => {
+      if (!this.active || this.provider !== provider) return;
+      if (d === 'ignore') {
+        this.dial(); // 旧 sid 的踢线：token 已经换好了，立即重连，1 秒内不显示提示
+      } else if (kicked !== null) {
+        this.emitKicked(kicked, code, until, recoverBefore);
+      } else {
+        this.active = false;
+        this.emit('fatal', { kind: 'closed', code, reason: '' });
+      }
+    };
+    const decision = provider.kickReceived(info);
+    if (typeof decision === 'string') apply(decision);
+    else void decision.then(apply);
+    return true;
+  }
+
+  /** 规则 7：等 token 来源给出新的（本地更新就立刻，否则刷新一次），然后重连。会话结束时 IMClient 从 onEnded 收到。 */
+  private onTokenRejected(provider: TokenProvider): void {
+    const gen = this.connGen;
+    this.rejectStreak += 1;
+    provider.tokenRejected(this.token).then(
+      () => {
+        if (gen !== this.connGen || !this.active || this.provider !== provider) return;
+        if (this.rejectStreak <= 1) this.dial();
+        else if (this.reconnectTimer === null) this.scheduleReconnect();
+      },
+      () => this.o.logger.debug('im: token rejected, session ended'),
+    );
   }
 
   /** 退避：1s、2s、4s… 最长 30s（上限是加抖动之前的值，C-22），再加 ±jitter。 */
@@ -350,6 +459,7 @@ export class Connection extends Emitter<ConnEvents> {
   private setState(s: ConnState): void {
     if (s === this.stateValue) return;
     this.stateValue = s;
+    this.provider?.connectionChanged(s === 'connected');
     this.emit('state', s);
   }
 }

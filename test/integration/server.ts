@@ -18,6 +18,8 @@ const CALLER_SCOPES = [
   'push.all',
   'group.write',
   'social.settings',
+  'account.invite',
+  'user.read',
 ];
 // 持有 push.all 的调用方必须配 pushTypes，否则 IM_PUSH_ENABLED 开启时启动失败（PRD-live F-PUSH-09 规则 3）。
 const CALLER_PUSH_TYPES = ['notice', 'promo'];
@@ -32,6 +34,10 @@ export const PUSH_ENV = { IM_PUSH_ENABLED: '1' };
 
 export interface RunningServer {
   wsURL: string;
+  /** http://127.0.0.1:端口，账号接口用。 */
+  httpURL: string;
+  /** 进程号：调用方确认自己只停了自己启动的进程。 */
+  pid: number;
   admin(method: string, path: string, body?: unknown): Promise<Record<string, unknown>>;
   /** 用调用方签名调用管理接口（protocol/ADMIN.md「鉴权」）。 */
   signed(method: string, path: string, body?: unknown): Promise<Record<string, unknown>>;
@@ -153,6 +159,8 @@ export async function startServer(env: Record<string, string> = {}): Promise<Run
   };
   return {
     wsURL: `ws://127.0.0.1:${port}/ws`,
+    httpURL: base,
+    pid: proc.pid ?? 0,
     admin,
     signed,
     token: async (userId) => String((await admin('POST', '/admin/users/token', { userId })).token),

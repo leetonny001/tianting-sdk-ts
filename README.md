@@ -66,6 +66,35 @@ new IMClient({ url, pushStart: 'latest' }); // 没有游标时只建立游标、
 - 没有持久化：游标只在内存，新实例和换账号都从 `afterSeq: 0` 开始。服务端未开启（4001）时静默，这次连接内不再发。
 - SDK 不把 `data` 写进日志。行为判据是 `protocol/vectors/push-sync.json`（`test/push-vectors.test.ts`，`persistence=true` 的用例跳过）。
 
+## 账号（PRD-chat C1）
+
+账号接口是 HTTP，独立于 `IMClient`。token 来源 HTTP 和 WS 共用（语义和 Kotlin、Swift 的对照基准见 tianting-server 的 `docs/sdk/README.md` 第 6 节）。
+
+```ts
+const account = new AccountClient({ baseUrl: 'https://im.example.com', platform: 'web', store });
+account.on('ended', (e) => …);                 // 回登录页。提示文字：sessionDialogText(e)
+account.on('recoveryCodeUnacked', () => …);    // 强制进保存恢复码页
+
+const { recoveryCode, recoveryCodeGen } = await account.login(username, password); // register、recover 同样
+await account.ackRecoveryCode(recoveryCodeGen!); // 确认之前 token 只放内存，确认后才写 store
+
+im.connect(account.tokenProvider);             // 账号模式：自动刷新、换 token 重连、4011 比较代号
+im.connect(token);                             // 演示模式：行为不变
+im.on('fatal', (r) => …);                      // kicked 带 recoverBefore；{kind:'session'} 是刷新得到 4019 等
+im.on('securityNotice', (n) => …);
+
+await account.start();                         // 启动：读 store，检查是否要刷新
+account.foreground();                          // 回到前台
+await account.changePassword(oldPw, newPw);    // 进行中缓存踢线，成功换新 sid 重连
+await account.logoutOthers(pw); await account.logout();
+await account.regenerateRecoveryCode(pw); await account.updateProfile({ nickname });
+await account.getConfig(); await account.listEvents();
+await account.requestDelete(pw); await account.cancelDelete(username, pw);
+```
+
+错误：`AccountError`（`status`、`code`、`reason`、`details`）、`AccountNetworkError`、`AccountTimeoutError`（30 秒，迟到的响应被丢弃）、`SessionEndedError`。
+测试替身：`@tianting/sdk/testing` 的 `FakeHttp`，配合 `FakeTransport`、`FakeClock`。
+
 ## 删除失败的消息（PRD-ui G-UI-14）
 
 ```ts

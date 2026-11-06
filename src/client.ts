@@ -48,6 +48,7 @@ import {
 } from './social.js';
 import { Store, type Conversation, type ConversationSnapshot, type Message } from './store.js';
 import { checkText, type TextCheck } from './text.js';
+import type { SessionEnd, TokenProvider } from './token-provider.js';
 import { WebSocketTransport, type Transport } from './transport.js';
 
 export interface IMClientTimings {
@@ -146,7 +147,22 @@ type ClientEvents = {
   push: [Push];
   /** 一轮补拉结束（4.8 节）。可选，不影响交付。 */
   pushSynced: [{ latestSeq: number }];
+  /** 账号在新设备登录等安全提醒（PRD-chat F-ACC-02 规则 3b）。不认识的 kind 不发。 */
+  securityNotice: [SecurityNotice];
+  /** auth ack 说最新一代恢复码没有确认（F-ACC-05 规则 1）：App 强制进保存页。 */
+  recoveryCodeUnacked: [];
+  /** 某人的资料变了，读 profileOf / displayName（F-ACC-06：自己改昵称后立即显示）。 */
+  profileChanged: [userId: string];
 };
+
+/** 这一批认识的 securityNotice（server/internal/protocol/frames.go）。 */
+const SECURITY_NOTICE_KINDS: ReadonlySet<string> = new Set(['newDeviceLogin']);
+
+export interface SecurityNotice {
+  kind: string;
+  at: number;
+  platform: Platform;
+}
 
 /** 社交命令的选项。 */
 export interface ApplyFriendOptions {
@@ -207,6 +223,8 @@ export class IMClient extends Emitter<ClientEvents> {
   private muteKey = this.mutes.key() + '[]'; // 没有全群禁言时的角色部分，见 mutesChanged
   private muteTimer: TimerHandle | null = null;
   private readonly pushes: PushSync;
+  private provider: TokenProvider | null = null;
+  private unsubscribeProvider: Array<() => void> = [];
 
   constructor(o: IMClientOptions) {
     super();
@@ -270,14 +288,47 @@ export class IMClient extends Emitter<ClientEvents> {
     return this.conn.state;
   }
 
-  connect(token: string): void {
+  /**
+   * 连接。传字符串是演示模式，行为不变；传 AccountClient.tokenProvider 是账号模式：
+   * 自动刷新、换 token 重连、4011 比较代号（PRD-chat 第 13.1 节，F-ACC-03 规则 5、7）。
+   */
+  connect(token: string | TokenProvider): void {
+    this.bindProvider(typeof token === 'string' ? null : token);
     this.conn.start(token);
   }
 
   /** 退出登录：以 1000 关闭，不再重连，清空内存数据（PRD F-AUTH-05）。 */
   disconnect(): void {
+    this.bindProvider(null);
     this.conn.stop();
     this.reset();
+  }
+
+  private bindProvider(p: TokenProvider | null): void {
+    if (p === this.provider) return;
+    for (const off of this.unsubscribeProvider) off();
+    this.provider = p;
+    this.unsubscribeProvider = p
+      ? [
+          p.onEnded((e) => this.onSessionEnded(e)),
+          p.onProfileChanged((userId, nickname) => {
+            this.profiles.put({ ...this.profiles.last(userId), userId, nickname } as UserProfile);
+            this.emit('profileChanged', userId);
+          }),
+        ]
+      : [];
+  }
+
+  /** 账号会话结束：退出时清空数据；其他情况和被踢一样回登录页。来自踢线的，连接已经发过 fatal。 */
+  private onSessionEnded(e: SessionEnd): void {
+    if (e.origin === 'kick') return;
+    this.bindProvider(null);
+    this.conn.stop();
+    if (e.action === 'logout') {
+      this.reset();
+      return;
+    }
+    this.onFatal({ kind: 'session', ...e });
   }
 
   /** 释放浏览器事件监听。 */
@@ -404,6 +455,7 @@ export class IMClient extends Emitter<ClientEvents> {
 
   /** 页面可见性变化时调用（开启 browserEvents 时自动调用）。 */
   visibilityChanged(): void {
+    if (this.isVisible()) this.provider?.foreground();
     this.maybeReportRead();
     this.expireMutes(); // 休眠后定时器可能晚到
   }
@@ -442,6 +494,10 @@ export class IMClient extends Emitter<ClientEvents> {
     if (this.self && this.self !== a.userId) this.reset(); // 换了账号
     this.self = a.userId;
     this.serverOffset = a.serverTime - this.clock.now();
+    if (a.recoveryCodeUnacked) {
+      this.provider?.recoveryCodeUnacked();
+      this.emit('recoveryCodeUnacked');
+    }
     this.mutes.setUser(a.mutedUntil); // 没有这个字段表示没有用户级禁言（离线期间可能已经解除）
     this.mutesChanged();
     this.flushQueued();
@@ -528,6 +584,11 @@ export class IMClient extends Emitter<ClientEvents> {
     if (f.cmd !== 'event') return;
     const ev = f.data as ServerEvent;
     switch (ev.type) {
+      case 'securityNotice':
+        if (SECURITY_NOTICE_KINDS.has(ev.kind)) {
+          this.emit('securityNotice', { kind: ev.kind, at: ev.at, platform: ev.platform });
+        }
+        return;
       case 'convAdded':
         this.store.upsertConversation(ev.conv);
         this.setGroupMute(ev.conv.convId, ev.conv.mutedUntil, ev.conv.allMuted);
@@ -748,6 +809,7 @@ export class IMClient extends Emitter<ClientEvents> {
 
   /** 被踢或不可重连的关闭：发送中 / 排队的消息全部标记失败（AC-AUTH-03-6），通知界面回到登录页。 */
   private onFatal(r: FatalReason): void {
+    this.bindProvider(null);
     this.clearSocial(); // 被踢：清空全部社交状态（PRD-social 10.2 节）
     // 按消息列表遍历：第一次发给新联系人时，会话还不在会话列表里（AC-AUTH-03-6）。
     for (const convId of this.store.messageConvIds()) this.failPending(convId);
