@@ -91,7 +91,7 @@ export interface AuthAck {
 }
 
 export type ServerEvent =
-  | { type: 'kicked'; reason: string; until?: number | null }
+  | { type: 'kicked'; reason: string; until?: number | null; recoverBefore?: number }
   | { type: 'msgDeleted'; convId: string; msgIds: string[]; seqs: number[] }
   | { type: 'muted'; scope: string; groupId?: string; mutedUntil: number | null }
   | { type: 'unmuted'; scope: string; groupId?: string }

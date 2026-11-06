@@ -34,8 +34,11 @@ export type { Conversation, ConversationSnapshot, Message, MessageStatus } from 
 export type { MuteInfo } from './mute.js';
 export { PUSH_DEFAULTS, type Push, type PushLimits, type PushStart } from './push.js';
 export { avatarColorIndex, avatarInitial, fnv1a32 } from './avatar.js';
+export { FetchHttpTransport, type HttpRequest, type HttpResponse, type HttpTransport } from './http.js';
 export {
+  CLIENT_ERROR_CODES,
   CloseCode,
+  ERROR_REASONS,
   ErrorCode,
   IMError,
   describeError,

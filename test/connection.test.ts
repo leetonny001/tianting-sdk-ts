@@ -109,6 +109,31 @@ describe('连接管理（FE-003）', () => {
     });
   }
 
+  it('不认识的踢线原因：关闭码可以重连就忽略它，继续重连（PRD-chat F-ACC-04 规则 5，FE-600）', async () => {
+    const h = setup();
+    const fatal: FatalReason[] = [];
+    h.im.on('fatal', (r) => fatal.push(r));
+    h.im.connect('t');
+    const c = await h.login();
+    c.receive({ cmd: 'event', data: { type: 'kicked', reason: 'futureReason' } });
+    c.drop(1006);
+    expect(fatal).toEqual([]);
+    h.clock.advance(1_000);
+    expect(h.transport.connections).toHaveLength(2);
+    expect(h.logs.some((l) => l.includes('unknown kick reason'))).toBe(true);
+  });
+
+  it('kicked 带 recoverBefore：fatal 带上它（PRD-chat F-ACC-03 规则 6a）', async () => {
+    const h = setup();
+    const fatal: FatalReason[] = [];
+    h.im.on('fatal', (r) => fatal.push(r));
+    h.im.connect('t');
+    const c = await h.login();
+    c.receive({ cmd: 'event', data: { type: 'kicked', reason: 'passwordChanged', recoverBefore: 123 } });
+    c.drop(4012);
+    expect(fatal).toEqual([{ kind: 'kicked', reason: 'passwordChanged', code: 4012, recoverBefore: 123 }]);
+  });
+
   it('关闭码 1000、4009 不重连（没有 kicked 也一样）', () => {
     for (const code of [1000, 4009]) {
       const h = setup();

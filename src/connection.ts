@@ -1,6 +1,6 @@
 import type { Clock, TimerHandle } from './clock.js';
 import { Emitter } from './emitter.js';
-import { CLOSE_RECONNECT, IMError } from './errors.js';
+import { CLOSE_RECONNECT, IMError, KICK_CLOSE_CODE } from './errors.js';
 import type { Logger } from './logger.js';
 import type { AuthAck, InboundFrame, Platform } from './protocol.js';
 import type { Transport, TransportConnection } from './transport.js';
@@ -9,8 +9,11 @@ export type ConnState = 'disconnected' | 'connecting' | 'connected';
 
 /** 连接不再自动重连的原因：被踢（kicked 事件），或者收到不应重连的关闭码（1000、4009～4012、4429）。 */
 export type FatalReason =
-  /** until 只在 reason = suspended 时有：封禁到期时间（毫秒），永久为 null。 */
-  | { kind: 'kicked'; reason: string; code: number; until?: number | null }
+  /**
+   * until 只在 reason = suspended 时有：封禁到期时间（毫秒），永久为 null。
+   * recoverBefore：找回截止日期（PRD-chat F-ACC-03 规则 6a）。
+   */
+  | { kind: 'kicked'; reason: string; code: number; until?: number | null; recoverBefore?: number }
   | { kind: 'closed'; code: number; reason: string };
 
 export interface ConnectionOptions {
@@ -103,6 +106,7 @@ export class Connection extends Emitter<ConnEvents> {
   private pongTimer: TimerHandle | null = null;
   private kickedReason: string | null = null;
   private kickedUntil: number | null | undefined;
+  private kickedRecoverBefore: number | undefined;
   private reqN = 0;
   private authId = '';
   private pending = new Map<string, Pending>();
@@ -177,6 +181,7 @@ export class Connection extends Emitter<ConnEvents> {
     const gen = ++this.connGen;
     this.kickedReason = null;
     this.kickedUntil = undefined;
+    this.kickedRecoverBefore = undefined;
     this.setState('connecting');
     const url = `${this.o.url}?platform=${encodeURIComponent(this.o.platform)}`;
     this.conn = this.o.transport.open(url, {
@@ -211,11 +216,13 @@ export class Connection extends Emitter<ConnEvents> {
         this.clearPong();
         return;
       case 'event': {
-        const ev = f.data as { type?: string; reason?: string; until?: number | null } | undefined;
+        const ev = f.data as
+          { type?: string; reason?: string; until?: number | null; recoverBefore?: number } | undefined;
         if (ev?.type === 'kicked') {
           // 先记下原因，等随后的关闭码到达时统一处理。
           this.kickedReason = ev.reason ?? '';
           this.kickedUntil = ev.until;
+          this.kickedRecoverBefore = typeof ev.recoverBefore === 'number' ? ev.recoverBefore : undefined;
           return;
         }
         this.emit('frame', f);
@@ -271,7 +278,13 @@ export class Connection extends Emitter<ConnEvents> {
   }
 
   private onClosed(code: number, reason: string): void {
-    const kicked = this.kickedReason;
+    // 不认识的踢线原因（PRD-chat F-ACC-04 规则 5，PRD-core 3.1 节）：关闭码说可以重连就忽略它；否则按关闭码结束，原因原样告诉界面。
+    const raw = this.kickedReason;
+    const known = raw !== null && raw in KICK_CLOSE_CODE;
+    const kicked = raw !== null && (known || CLOSE_RECONNECT[code] === false) ? raw : null;
+    if (raw !== null && !known) this.o.logger.warn(`im: unknown kick reason, close code ${code}`);
+    const until = this.kickedUntil;
+    const recoverBefore = this.kickedRecoverBefore;
     this.teardown();
     this.setState('disconnected');
     if (!this.active) return;
@@ -279,8 +292,13 @@ export class Connection extends Emitter<ConnEvents> {
     // 被踢不重连（PRD F-AUTH-03 规则 4），例外：服务端下线按退避重连（C-55）。
     if (kicked !== null && kicked !== 'serverShutdown') {
       this.active = false;
-      const until = this.kickedUntil;
-      this.emit('fatal', { kind: 'kicked', reason: kicked, code, ...(until !== undefined ? { until } : {}) });
+      this.emit('fatal', {
+        kind: 'kicked',
+        reason: kicked,
+        code,
+        ...(until !== undefined ? { until } : {}),
+        ...(recoverBefore !== undefined ? { recoverBefore } : {}),
+      });
       return;
     }
     // 1000、4009～4012、4429 不重连；未列出的关闭码（1006 等）按可以重连处理。

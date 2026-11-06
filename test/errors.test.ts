@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { CloseCode, ErrorCode, describeError } from '../src/index.js';
+import { CLIENT_ERROR_CODES, CloseCode, ERROR_REASONS, ErrorCode, describeError } from '../src/index.js';
 
 const spec = JSON.parse(readFileSync(new URL('../protocol/errors.json', import.meta.url), 'utf8'));
 
@@ -28,5 +28,24 @@ describe('错误码（AC-SYS-01-3、AC-SYS-01-4、C-09）', () => {
     expect(describeError(4049).category).toBe('notFound');
     expect(describeError(4299)).toMatchObject({ category: 'rateLimited', retryable: false });
     expect(describeError(5999)).toMatchObject({ category: 'server', retryable: true });
+  });
+
+  it('TC-CHAT-90-12 client scope 的码都在枚举里，和 errors.json 一致（AC-CHAT-90-14）', () => {
+    const client = spec.errors.filter((e: { scope: string[] }) => e.scope.includes('client'));
+    expect(client.length).toBeGreaterThan(0);
+    expect([...CLIENT_ERROR_CODES].sort()).toEqual(client.map((e: { code: number }) => e.code).sort());
+    for (const e of client as Array<{ name: string; code: number }>) {
+      expect((ErrorCode as Record<string, number>)[e.name]).toBe(e.code);
+    }
+    for (const name of [
+      'ACCOUNT_CREDENTIALS_INVALID',
+      'REFRESH_TOKEN_INVALID',
+      'USERNAME_TAKEN',
+      'ACCOUNT_LOGIN_LOCKED',
+    ]) {
+      expect(ErrorCode).toHaveProperty(name);
+    }
+    const { $comment: _ignored, ...reasons } = spec.reasons as Record<string, unknown>;
+    expect(ERROR_REASONS).toEqual(reasons);
   });
 });

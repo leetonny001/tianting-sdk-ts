@@ -17,6 +17,9 @@ export const ErrorCode = {
   TOKEN_REVOKED: 4012,
   ADMIN_KEY_INVALID: 4013,
   ADMIN_SIGNATURE_INVALID: 4017,
+  ACCOUNT_CREDENTIALS_INVALID: 4018,
+  REFRESH_TOKEN_INVALID: 4019,
+  FILE_NOT_FOUND: 4048,
   FORBIDDEN: 4030,
   MUTED: 4031,
   NOT_CONV_PARTICIPANT: 4032,
@@ -35,6 +38,7 @@ export const ErrorCode = {
   GROUP_EXISTS: 4090,
   FRIEND_REQUEST_HANDLED: 4091,
   PUSH_ID_CONFLICT: 4094,
+  USERNAME_TAKEN: 4095,
   GROUP_MEMBER_LIMIT_EXCEEDED: 4130,
   BATCH_LIMIT_EXCEEDED: 4131,
   FRIEND_LIMIT_EXCEEDED: 4132,
@@ -45,6 +49,7 @@ export const ErrorCode = {
   STRANGER_MSG_LIMIT: 4137,
   RATE_LIMITED: 4290,
   QUOTA_EXCEEDED: 4292,
+  ACCOUNT_LOGIN_LOCKED: 4294,
   INTERNAL: 5000,
   SERVICE_UNAVAILABLE: 5030,
 } as const;
@@ -67,11 +72,14 @@ export const ERROR_INFO: Readonly<Record<number, { name: string; retryable: bool
   4012: { name: "TOKEN_REVOKED", retryable: false, message: "账号已被强制下线" },
   4013: { name: "ADMIN_KEY_INVALID", retryable: false, message: "管理密钥无效" },
   4017: { name: "ADMIN_SIGNATURE_INVALID", retryable: false, message: "管理接口签名无效" },
+  4018: { name: "ACCOUNT_CREDENTIALS_INVALID", retryable: false, message: "用户名、密码或恢复码错误（不区分）" },
+  4019: { name: "REFRESH_TOKEN_INVALID", retryable: false, message: "refresh token 无效、过期、吊销或被重放" },
+  4048: { name: "FILE_NOT_FOUND", retryable: false, message: "文件不存在、无权访问、已过期或已撤回（不区分）" },
   4030: { name: "FORBIDDEN", retryable: false, message: "无权限" },
   4031: { name: "MUTED", retryable: false, message: "被禁言，不能发言" },
   4032: { name: "NOT_CONV_PARTICIPANT", retryable: false, message: "不是该会话的参与者" },
   4033: { name: "NOT_GROUP_MEMBER", retryable: false, message: "不是群成员" },
-  4034: { name: "USER_BANNED", retryable: false, message: "用户被封禁，不能签发 token / 演示登录（details.bannedUntil，永久为 null）" },
+  4034: { name: "USER_BANNED", retryable: false, message: "用户被封禁，不能签发 token / 演示登录 / 账号登录（details.bannedUntil，永久为 null）" },
   4035: { name: "NOT_FRIEND", retryable: false, message: "不是好友" },
   4036: { name: "REJECTED_BY_PEER", retryable: false, message: "消息被对方拒收" },
   4039: { name: "MSG_READ_GRANT_REQUIRED", retryable: false, message: "没有该会话有效的正文 / 隔离原文查看授权" },
@@ -85,6 +93,7 @@ export const ERROR_INFO: Readonly<Record<number, { name: string; retryable: bool
   4090: { name: "GROUP_EXISTS", retryable: false, message: "群 ID 已存在" },
   4091: { name: "FRIEND_REQUEST_HANDLED", retryable: false, message: "申请已同意" },
   4094: { name: "PUSH_ID_CONFLICT", retryable: false, message: "同一 pushId 的调用方或内容不同" },
+  4095: { name: "USERNAME_TAKEN", retryable: false, message: "用户名已存在或保留" },
   4130: { name: "GROUP_MEMBER_LIMIT_EXCEEDED", retryable: false, message: "群成员已达上限" },
   4131: { name: "BATCH_LIMIT_EXCEEDED", retryable: false, message: "单次批量操作数量超限" },
   4132: { name: "FRIEND_LIMIT_EXCEEDED", retryable: false, message: "好友数量已达上限" },
@@ -95,8 +104,38 @@ export const ERROR_INFO: Readonly<Record<number, { name: string; retryable: bool
   4137: { name: "STRANGER_MSG_LIMIT", retryable: false, message: "对方回复前的条数已用完" },
   4290: { name: "RATE_LIMITED", retryable: true, message: "操作过于频繁" },
   4292: { name: "QUOTA_EXCEEDED", retryable: false, message: "今天的次数已用完" },
+  4294: { name: "ACCOUNT_LOGIN_LOCKED", retryable: false, message: "尝试过多，暂时锁定（details.retryAfterSeconds）" },
   5000: { name: "INTERNAL", retryable: true, message: "服务器内部错误" },
   5030: { name: "SERVICE_UNAVAILABLE", retryable: true, message: "服务暂不可用" },
+};
+
+/** client scope 的错误码：账号和文件的 HTTP 接口会返回（PRD-chat 第 11.5 节，F-SYS-01）。 */
+export const CLIENT_ERROR_CODES: readonly number[] = [
+  4000,
+  4004,
+  4010,
+  4011,
+  4012,
+  4018,
+  4019,
+  4048,
+  4030,
+  4034,
+  4095,
+  4290,
+  4292,
+  4294,
+  5000,
+  5030,
+];
+
+/** 错误码 → 细分的 reason（PRD-chat 第 11.5 节）。收到没有列出的 reason 不能报错。 */
+export const ERROR_REASONS: Readonly<Record<number, readonly string[]>> = {
+  4000: ["passwordWeak","recoveryCodeStale"],
+  4011: ["tokenSuperseded"],
+  4019: ["invalid","expired","revoked","superseded","replayDetected","credentialsChanged","loggedOutOthers","accountDeleted"],
+  4030: ["registerClosed","inviteInvalid","accountSessionRequired","accountExists","accountDeletionPending","featureDisabled"],
+  4290: ["recoverLimited"],
 };
 
 /** WebSocket 关闭码。 */
@@ -137,6 +176,9 @@ export const KICK_CLOSE_CODE: Readonly<Record<string, number | null>> = {
   tokenExpired: 4011,
   banned: 4012,
   suspended: 4012,
+  passwordChanged: 4012,
+  sessionRevoked: 4012,
+  accountDeleted: 4012,
   tooManyConnections: 4429,
   serverShutdown: 1001,
   replaced: null,

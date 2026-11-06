@@ -1,6 +1,13 @@
 import { ERROR_INFO } from './errors.gen.js';
 
-export { ErrorCode, CloseCode, CLOSE_RECONNECT, KICK_CLOSE_CODE } from './errors.gen.js';
+export {
+  ErrorCode,
+  CloseCode,
+  CLIENT_ERROR_CODES,
+  CLOSE_RECONNECT,
+  ERROR_REASONS,
+  KICK_CLOSE_CODE,
+} from './errors.gen.js';
 
 /** 错误码的分类，界面据此决定文案（PRD F-SYS-01、C-09）。 */
 export type ErrorCategory = 'badRequest' | 'forbidden' | 'notFound' | 'rateLimited' | 'server';

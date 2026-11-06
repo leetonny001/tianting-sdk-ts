@@ -26,6 +26,18 @@ export function render(spec) {
     ),
     '};',
     '',
+    '/** client scope 的错误码：账号和文件的 HTTP 接口会返回（PRD-chat 第 11.5 节，F-SYS-01）。 */',
+    'export const CLIENT_ERROR_CODES: readonly number[] = [',
+    ...spec.errors.filter((e) => e.scope.includes('client')).map((e) => `  ${e.code},`),
+    '];',
+    '',
+    '/** 错误码 → 细分的 reason（PRD-chat 第 11.5 节）。收到没有列出的 reason 不能报错。 */',
+    'export const ERROR_REASONS: Readonly<Record<number, readonly string[]>> = {',
+    ...Object.entries(spec.reasons ?? {})
+      .filter(([k]) => k !== '$comment')
+      .map(([k, v]) => `  ${k}: ${JSON.stringify(v)},`),
+    '};',
+    '',
     '/** WebSocket 关闭码。 */',
     'export const CloseCode = {',
     ...spec.closeCodes.map((c) => `  ${c.name}: ${c.code},`),
