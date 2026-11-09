@@ -680,6 +680,51 @@ describe('TC-ACC-03-45 access 到期等于绝对上限（AC-ACC-03-43）', () =>
     expect(h.http.to(REFRESH)).toHaveLength(1);
   });
 
+  it('P-35 L1：上限前最后一秒服务端踢 kicked/tokenExpired，直接登录失效，不发刷新、不重连', async () => {
+    const h = setupAccount();
+    const w = watch(h);
+    const at = await capped(h);
+    const c = await h.online();
+    h.clock.advance(at - h.clock.now() - 400); // JWT 的 exp 只到秒：服务端比本地的上限早不到 1 秒踢
+    c.receive({ cmd: 'event', data: { type: 'kicked', reason: 'tokenExpired' } });
+    c.drop(4011);
+    await flush();
+    expect(w.ended[0]).toMatchObject({ action: 'login', dialog: 'sessionExpired', reason: 'expired' });
+    expect(w.fatal[0]).toMatchObject({ kind: 'session', dialog: 'sessionExpired' });
+    expect(h.account.session).toBeNull();
+    h.clock.advance(120_000);
+    await flush();
+    expect(h.http.to(REFRESH)).toHaveLength(1); // 只有 capped 里那一次
+    expect(h.transport.connections).toHaveLength(1);
+  });
+
+  it('P-35 L1：只有关闭码 4011（没有 kicked 帧）同样不刷新', async () => {
+    const h = setupAccount();
+    const w = watch(h);
+    const at = await capped(h);
+    const c = await h.online();
+    h.clock.advance(at - h.clock.now() - 400);
+    c.drop(4011);
+    await flush();
+    expect(w.ended[0]).toMatchObject({ action: 'login', dialog: 'sessionExpired' });
+    h.clock.advance(120_000);
+    await flush();
+    expect(h.http.to(REFRESH)).toHaveLength(1);
+    expect(h.transport.connections).toHaveLength(1);
+  });
+
+  it('P-35 L1 只看到期等于上限：普通 token 的 kicked/tokenExpired 仍然刷新一次', async () => {
+    const h = setupAccount();
+    const w = watch(h);
+    h.session(1, DAY);
+    const c = await h.online();
+    c.receive({ cmd: 'event', data: { type: 'kicked', reason: 'tokenExpired' } });
+    c.drop(4011);
+    await flush();
+    expect(h.http.to(REFRESH)).toHaveLength(1);
+    expect(w.ended).toEqual([]);
+  });
+
   it('没有连接：到期后回前台或拨号都回登录页，不发刷新', async () => {
     const h = setupAccount();
     const w = watch(h);

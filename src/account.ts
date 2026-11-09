@@ -317,6 +317,11 @@ export class AccountClient extends Emitter<AccountClientEvents> {
     }
     if (source === 'kicked') {
       if (isLocalNewer(this.lineage, rejected ?? {})) return this.record({ action: 'useLocal' });
+      // access 的到期就是绝对上限（P-35 L1）：刷新换不来更晚的 token，服务端在上限那一秒踢 tokenExpired 时直接登录失效，不再问一次。
+      if (s.absoluteExpiresAt !== undefined && s.accessExpiresAt === s.absoluteExpiresAt) {
+        this.endSession({ action: 'login', dialog: 'sessionExpired', reason: 'expired' });
+        return this.record({ action: 'login', dialog: 'sessionExpired' });
+      }
       this.mustRefresh = true;
     }
     return this.record(this.decideRefresh(source));
@@ -952,14 +957,34 @@ export class AccountClient extends Emitter<AccountClientEvents> {
     return { platform: this.platform, ...(this.deviceName ? { deviceName: this.deviceName } : {}) };
   }
 
+  /**
+   * 带 Bearer 的其他 /v1 接口（文件接口用，PRD-chat F-FILE-01、04，RS5-10：HTTP 和 WS 共用 token）。
+   * 4011 的处理同账号接口（规则 7）：本地更新就用本地值重试，否则等一次刷新，同一请求最多重试 2 次。
+   * signal 中止时以 AccountNetworkError('aborted') 结束。实现了 FileAuth。
+   */
+  authorized<T>(
+    method: HttpRequest['method'],
+    path: string,
+    body?: unknown,
+    opts: { signal?: AbortSignal } = {},
+  ): Promise<T> {
+    return this.authed<T>(method, path, body, opts.signal);
+  }
+
   /** 不在队列里的带 Bearer 请求：带旧 token 得到 4011 时用本地值重试，或者等一次刷新（规则 7）。 */
-  private async authed<T>(method: HttpRequest['method'], path: string, body?: unknown): Promise<T> {
+  private async authed<T>(
+    method: HttpRequest['method'],
+    path: string,
+    body?: unknown,
+    cancel?: AbortSignal,
+  ): Promise<T> {
     for (let i = 0; ; i++) {
       const s = this.session_;
       if (!s) throw new SessionEndedError();
       const token = await this.accessToken();
+      if (cancel?.aborted) throw new AccountNetworkError('aborted');
       try {
-        return await this.sendAuthed<T>(method, path, body, token);
+        return await this.sendAuthed<T>(method, path, body, token, cancel);
       } catch (err) {
         if (i >= HTTP_4011_RETRIES || !is4011(err)) throw err;
         const rejected = lineageOf(token);
@@ -970,9 +995,15 @@ export class AccountClient extends Emitter<AccountClientEvents> {
     }
   }
 
-  private async sendAuthed<T>(method: HttpRequest['method'], path: string, body: unknown, token: string): Promise<T> {
+  private async sendAuthed<T>(
+    method: HttpRequest['method'],
+    path: string,
+    body: unknown,
+    token: string,
+    cancel?: AbortSignal,
+  ): Promise<T> {
     try {
-      return await this.send<T>(method, path, body, { bearer: token });
+      return await this.send<T>(method, path, body, { bearer: token, cancel });
     } catch (err) {
       // access 已被吊销：和连接上的 4012 一样，回登录页。token 已经不是当前的（换过 sid）就不算。
       if (
@@ -992,7 +1023,7 @@ export class AccountClient extends Emitter<AccountClientEvents> {
     method: HttpRequest['method'],
     path: string,
     body?: unknown,
-    opts: { bearer?: string; signal?: AbortSignal } = {},
+    opts: { bearer?: string; signal?: AbortSignal; cancel?: AbortSignal } = {},
   ): Promise<T> {
     const headers: Record<string, string> = { Accept: 'application/json' };
     if (body !== undefined) headers['Content-Type'] = 'application/json';
@@ -1012,13 +1043,23 @@ export class AccountClient extends Emitter<AccountClientEvents> {
         abort.abort();
         reject(new AccountTimeoutError());
       }, this.timeoutMs);
+      // 调用方取消（文件上传被用户取消）：中止请求，不等响应。
+      const onCancel = () => {
+        this.clock.clearTimeout(timer);
+        abort.abort();
+        reject(new AccountNetworkError('aborted'));
+      };
+      if (opts.cancel?.aborted) onCancel();
+      else opts.cancel?.addEventListener('abort', onCancel, { once: true });
       this.exchange<T>({ ...req, signal: abort.signal }, path).then(
         (v) => {
           this.clock.clearTimeout(timer);
+          opts.cancel?.removeEventListener('abort', onCancel);
           resolve(v);
         },
         (e: unknown) => {
           this.clock.clearTimeout(timer);
+          opts.cancel?.removeEventListener('abort', onCancel);
           reject(e instanceof Error ? e : new AccountNetworkError());
         },
       );

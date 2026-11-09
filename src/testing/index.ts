@@ -2,3 +2,4 @@
 export { FakeClock } from './fake-clock.js';
 export { FakeConnection, FakeTransport } from './fake-transport.js';
 export { FakeHttp, FakeHttpCall } from './fake-http.js';
+export { FakeUpload, FakeUploadCall } from './fake-upload.js';

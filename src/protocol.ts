@@ -12,11 +12,37 @@ export interface TipBody {
   text: string;
 }
 
+/**
+ * 图片消息（PRD-chat F-FILE-02）。下行的 size、mime、宽高是服务端记录的真实值；expired=true 时对象已删除，不再发放地址。
+ * 本地还没上传完的消息 fileId 是空字符串。
+ */
+export interface ImageBody {
+  fileId: string;
+  width?: number;
+  height?: number;
+  size?: number;
+  mime?: string;
+  expired?: boolean;
+}
+
+/** 文件消息（F-FILE-03）。name 是清洗后的文件名，过期后为空字符串（F-FILE-06 规则 3）。文件名不进日志。 */
+export interface FileBody {
+  fileId: string;
+  name?: string;
+  size?: number;
+  mime?: string;
+  expired?: boolean;
+}
+
 export interface MsgBody {
   text?: string;
   data?: unknown;
   tip?: TipBody;
+  image?: ImageBody;
+  file?: FileBody;
 }
+
+export type MsgType = 'text' | 'custom' | 'tip' | 'image' | 'file';
 
 export type GroupRole = 'owner' | 'admin' | 'member';
 
@@ -27,7 +53,7 @@ export interface ServerMessage {
   convId: string;
   seq: number;
   from: string;
-  type: 'text' | 'custom' | 'tip';
+  type: MsgType;
   /** 被删除的消息没有 body（PRD-core F-MSG-05 规则 7）。 */
   body?: MsgBody;
   ts: number;
@@ -64,6 +90,8 @@ export interface ServerConversation {
   mutedUntil?: number | null;
   /** 该群开启了全群禁言时才有（P1，F-ADM-42）；群主、管理员也带，但不受限。 */
   allMuted?: boolean;
+  /** 已有消息的展示内容变化的版本号（C2：文件过期），变化时重拉这个会话（F-RCL-03 规则 2）。老服务端没有。 */
+  modVer?: number;
 }
 
 export interface SendAck {

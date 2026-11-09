@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
-import { AccountClient, type AccountSession, type SessionStore } from '../../src/index.js';
-import { FakeClock, FakeHttp } from '../../src/testing/index.js';
+import { AccountClient, FileClient, type AccountSession, type FileAuth, type SessionStore } from '../../src/index.js';
+import { FakeClock, FakeHttp, FakeUpload } from '../../src/testing/index.js';
 import { setup, type Harness } from '../helpers.js';
 import { SchemaValidator } from './json-schema.js';
 
@@ -86,8 +86,26 @@ export class MemoryStore implements SessionStore {
   }
 }
 
+/** endpoints 的键（`POST /v1/files/{fileId}/complete`）对应的请求，路径参数按 FileId 的字符集匹配。 */
+export function endpointKey(method: string, path: string): string | undefined {
+  if (httpSchema.endpoints[`${method} ${path}`]) return `${method} ${path}`;
+  for (const k of Object.keys(httpSchema.endpoints)) {
+    const re = new RegExp(`^${k.replace(/[.*+?^$()|[\]\\]/g, '\\$&').replace(/\{[^}]+\}/g, '[A-Za-z0-9_-]{1,64}')}$`);
+    if (re.test(`${method} ${path}`)) return k;
+  }
+  return undefined;
+}
+
+export function endpointOf(method: string, path: string): { request?: string; response: string } | undefined {
+  const k = endpointKey(method, path);
+  return k ? httpSchema.endpoints[k] : undefined;
+}
+
 export interface AccountHarness extends Harness {
   http: FakeHttp;
+  /** 对象存储的 PUT。 */
+  upload: FakeUpload;
+  files: FileClient;
   account: AccountClient;
   store: MemoryStore;
   /** 不符合 http-client.schema.json 的请求体。 */
@@ -104,15 +122,19 @@ const START = 1_800_000_000_000;
 
 export function accountSetup(): AccountHarness {
   const clock = new FakeClock(START);
+  const upload = new FakeUpload();
+  let accountRef: AccountClient | null = null;
+  const lazyAuth: FileAuth = { authorized: (m, p, b, o) => accountRef!.authorized(m, p, b, o) };
+  const files = new FileClient({ auth: lazyAuth, upload, clock, random: () => 0.5 });
   // 这里测的不是心跳：关掉，否则推进时钟时没人回 pong，连接会被判定断开。
-  const h = setup({ clock, timings: { heartbeatMs: 10 * 365 * 24 * HOUR } });
+  const h = setup({ clock, timings: { heartbeatMs: 10 * 365 * 24 * HOUR }, files });
   const http = new FakeHttp();
   const store = new MemoryStore();
   const badRequests: string[] = [];
   let peak = 0;
   http.onRequest = (call) => {
     peak = Math.max(peak, http.pending.length);
-    const ep = httpSchema.endpoints[`${call.req.method} ${call.path}`];
+    const ep = endpointOf(call.req.method, call.path);
     if (!ep) {
       badRequests.push(`no endpoint ${call.req.method} ${call.path}`);
     } else if (ep.request) {
@@ -133,9 +155,12 @@ export function accountSetup(): AccountHarness {
     logger,
     random: () => 0.5,
   });
+  accountRef = account;
   const out: AccountHarness = {
     ...h,
     http,
+    upload,
+    files,
     account,
     store,
     badRequests,

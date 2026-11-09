@@ -9,7 +9,18 @@ import {
   type FatalReason,
 } from './connection.js';
 import { Emitter } from './emitter.js';
+import { AccountError } from './account.js';
 import { ErrorCode, IMError } from './errors.js';
+import {
+  sizeOf,
+  UploadPutError,
+  type FileClient,
+  type FileInput,
+  type FileUrlItem,
+  type FileUrlResult,
+  type ProcessedImage,
+  type UploadData,
+} from './files.js';
 import { silentLogger, type Logger } from './logger.js';
 import { MuteTable, type MuteInfo } from './mute.js';
 import { PUSH_DEFAULTS, PushSync, type Push, type PushLimits, type PushStart, type PushSyncAck } from './push.js';
@@ -46,7 +57,7 @@ import {
   type SocialSyncAck,
   type UserProfile,
 } from './social.js';
-import { Store, type Conversation, type ConversationSnapshot, type Message } from './store.js';
+import { Store, type Conversation, type ConversationSnapshot, type Message, type MessageError } from './store.js';
 import { checkText, type TextCheck } from './text.js';
 import type { SessionEnd, TokenProvider } from './token-provider.js';
 import { WebSocketTransport, type Transport } from './transport.js';
@@ -87,6 +98,35 @@ export interface IMClientOptions {
   pushStart?: PushStart;
   /** 覆盖推送的上限和等待时间（都未校准，4.3、4.4 节）。 */
   pushLimits?: Partial<PushLimits>;
+  /** 图片和文件（PRD-chat 第 13.1 节）。没有时 sendImage、sendFile、getFileUrls 抛错。 */
+  files?: FileClient;
+}
+
+/** sendImage、sendFile 的选项。 */
+export interface AttachmentOptions {
+  /** 上传进度：已发送字节、总字节（原图 + 缩略图）。 */
+  onProgress?: (sent: number, total: number) => void;
+  /** 中止等于 cancelUpload。 */
+  signal?: AbortSignal;
+}
+
+/** 附件的源（F-FILE-07 规则 2：H5 只在内存，刷新就没有了）。上传成功、消息发出后释放。 */
+interface AttachmentSource {
+  kind: 'image' | 'file';
+  /** 还没处理好的图片：轮到它时才调用（并发 1，规则 6）。 */
+  produce?: () => Promise<ProcessedImage>;
+  image?: ProcessedImage;
+  file?: FileInput;
+  onProgress?: (sent: number, total: number) => void;
+}
+
+interface UploadJob {
+  convId: string;
+  clientMsgId: string;
+  abort: AbortController;
+  /** 申请成功后才有：取消时据此发 DELETE。 */
+  fileId?: string;
+  completed: boolean;
 }
 
 const DEFAULTS: IMClientTimings = {
@@ -151,6 +191,11 @@ type ClientEvents = {
   securityNotice: [SecurityNotice];
   /** auth ack 说最新一代恢复码没有确认（F-ACC-05 规则 1）：App 强制进保存页。 */
   recoveryCodeUnacked: [];
+  /**
+   * 这些文件已过期或所在消息被删除（F-FILE-06 规则 3、AC-FILE-06-12）：SDK 已经丢掉它们的地址，
+   * App 清掉按 fileId + variant 缓存的图片。
+   */
+  filesExpired: [fileIds: string[]];
   /** 某人的资料变了，读 profileOf / displayName（F-ACC-06：自己改昵称后立即显示）。 */
   profileChanged: [userId: string];
 };
@@ -233,6 +278,12 @@ export class IMClient extends Emitter<ClientEvents> {
   private readonly pushes: PushSync;
   private provider: TokenProvider | null = null;
   private unsubscribeProvider: Array<() => void> = [];
+  private readonly files: FileClient | null;
+  private sources = new Map<string, AttachmentSource>(); // clientMsgId → 源
+  private uploadQueue: Array<{ convId: string; clientMsgId: string }> = [];
+  private job: UploadJob | null = null;
+  /** 最近一次重拉时各会话的 modVer（F-RCL-03 规则 2）：变了才重拉这个会话的已加载范围。 */
+  private modVers = new Map<string, number>();
 
   constructor(o: IMClientOptions) {
     super();
@@ -243,6 +294,7 @@ export class IMClient extends Emitter<ClientEvents> {
     this.isVisible = o.isVisible ?? (() => typeof document === 'undefined' || document.visibilityState !== 'hidden');
     this.onListenerError = (err) => this.log.error('im: listener error', err);
     this.store = new Store(() => this.self);
+    this.files = o.files ?? null;
     this.profiles = new ProfileCache(() => this.clock.now());
     this.socialSnap = {
       friends: [],
@@ -378,6 +430,259 @@ export class IMClient extends Emitter<ClientEvents> {
   }
 
   /**
+   * 发图片（PRD-chat 第 13.1 节，F-FILE-02、07）。先插入一条"处理中"的消息并立即返回；轮到它时（全局并发 1，
+   * 同一会话按选择顺序）调用 processed 拿到处理好的图片，上传（申请 → PUT 原图、缩略图 → complete），
+   * 再按文本的规则 send。文字可以越过上传中的图片（规则 5）。上传中的时间不算 10 秒发送超时（规则 8）。
+   * 处理失败 error='process'；4292、4290（uploadPendingLimit）不自动重试（F-FILE-01 规则 6、6a）。
+   */
+  sendImage(
+    convId: string,
+    processed: ProcessedImage | (() => Promise<ProcessedImage>),
+    opts: AttachmentOptions = {},
+  ): Message {
+    const src: AttachmentSource =
+      typeof processed === 'function'
+        ? { kind: 'image', produce: processed, onProgress: opts.onProgress }
+        : { kind: 'image', image: processed, onProgress: opts.onProgress };
+    const body =
+      typeof processed === 'function'
+        ? { image: { fileId: '' } }
+        : {
+            image: {
+              fileId: '',
+              width: processed.width,
+              height: processed.height,
+              size: sizeOf(processed.original.data),
+              mime: processed.original.mime,
+            },
+          };
+    return this.addAttachment(
+      convId,
+      'image',
+      body,
+      src,
+      opts.signal,
+      typeof processed === 'function' ? 'processing' : 'uploading',
+    );
+  }
+
+  /** 发文件（F-FILE-03、07）：内容不重新编码。其余同 sendImage。 */
+  sendFile(convId: string, file: FileInput, opts: AttachmentOptions = {}): Message {
+    const mime = file.mime || 'application/octet-stream';
+    const body = { file: { fileId: '', name: file.name, size: sizeOf(file.data), mime } };
+    return this.addAttachment(
+      convId,
+      'file',
+      body,
+      { kind: 'file', file: { ...file, mime }, onProgress: opts.onProgress },
+      opts.signal,
+      'uploading',
+    );
+  }
+
+  /**
+   * 取消一条还没发出的附件（AC-FILE-02-5、AC-FILE-01-17）：中止上传，已经申请过的发 DELETE /v1/files/uploads/{id}，
+   * 消息从列表消失，不发 send。已经在 send 的不能取消，返回 false。失败的附件也可以用它删除。
+   */
+  cancelUpload(convId: string, clientMsgId: string): boolean {
+    const list = this.store.list(convId);
+    const m = list.local(clientMsgId);
+    if (!m || (m.type !== 'image' && m.type !== 'file')) return false;
+    if (!list.removeUnsent(clientMsgId, ['processing', 'uploading', 'queued', 'failed'])) return false;
+    const job = this.job;
+    if (job && job.clientMsgId === clientMsgId) {
+      job.abort.abort();
+      this.job = null;
+      if (job.fileId) void this.files?.cancelUpload(job.fileId);
+      this.pumpUploads();
+    } else {
+      const id = m.body.image?.fileId || m.body.file?.fileId;
+      if (id) void this.files?.cancelUpload(id);
+    }
+    this.uploadQueue = this.uploadQueue.filter((q) => q.clientMsgId !== clientMsgId);
+    this.sources.delete(clientMsgId);
+    this.emitMessages(convId);
+    return true;
+  }
+
+  /**
+   * 取下载地址（F-FILE-04）。同一个事件循环内的调用合并成一批（每批 ≤ 50），没过期的地址用缓存（AC-FILE-04-10）。
+   * 已知过期的文件不发请求，直接 code=4048（AC-FILE-06-6）。地址不要持久化、打日志（规则 5）。
+   */
+  async getFileUrls(items: readonly FileUrlItem[]): Promise<FileUrlResult[]> {
+    const files = this.requireFiles();
+    const ask = items.filter((i) => !this.store.fileExpired(i.fileId));
+    const got = ask.length ? await files.getFileUrls(ask) : [];
+    let k = 0;
+    return items.map((i) => (this.store.fileExpired(i.fileId) && !ask.includes(i) ? { ...i, code: 4048 } : got[k++]!));
+  }
+
+  private requireFiles(): FileClient {
+    if (!this.files) throw new Error('files not configured: pass IMClientOptions.files');
+    return this.files;
+  }
+
+  private addAttachment(
+    convId: string,
+    type: 'image' | 'file',
+    body: Message['body'],
+    src: AttachmentSource,
+    signal: AbortSignal | undefined,
+    status: 'processing' | 'uploading',
+  ): Message {
+    this.requireFiles();
+    if (!this.self) throw new NotConnectedError();
+    parseConvIdStrict(convId, this.self);
+    const msg: Message = {
+      clientMsgId: this.newId(),
+      convId,
+      from: this.self,
+      type,
+      body,
+      ts: this.clock.now(),
+      status,
+    };
+    this.store.list(convId).addLocal(msg);
+    this.sources.set(msg.clientMsgId, src);
+    this.emitMessages(convId);
+    if (signal) {
+      if (signal.aborted) this.cancelUpload(convId, msg.clientMsgId);
+      else signal.addEventListener('abort', () => this.cancelUpload(convId, msg.clientMsgId), { once: true });
+    }
+    if (this.store.list(convId).local(msg.clientMsgId)) this.enqueueUpload(convId, msg.clientMsgId);
+    return msg;
+  }
+
+  private enqueueUpload(convId: string, clientMsgId: string): void {
+    this.uploadQueue.push({ convId, clientMsgId });
+    this.pumpUploads();
+  }
+
+  /** 全局一个上传（F-FILE-07 规则 6），按入队顺序（规则 5）。 */
+  private pumpUploads(): void {
+    if (this.job) return;
+    const next = this.uploadQueue.shift();
+    if (!next) return;
+    const job: UploadJob = { ...next, abort: new AbortController(), completed: false };
+    this.job = job;
+    void this.runUpload(job).finally(() => {
+      if (this.job === job) this.job = null;
+      this.pumpUploads();
+    });
+  }
+
+  private async runUpload(job: UploadJob): Promise<void> {
+    const { convId, clientMsgId } = job;
+    const files = this.files!;
+    const list = () => this.store.list(convId);
+    const alive = () => this.job === job && !job.abort.signal.aborted && list().local(clientMsgId) !== undefined;
+    const src = this.sources.get(clientMsgId);
+    if (!src || !alive()) return;
+    let data: { kind: 'image' | 'file'; name: string; main: UploadData; thumb?: UploadData };
+    if (src.kind === 'image') {
+      if (!src.image && src.produce) {
+        try {
+          src.image = await src.produce();
+        } catch {
+          if (alive()) this.failAttachment(convId, clientMsgId, 'process');
+          return;
+        }
+        if (!alive()) return;
+      }
+      const img = src.image!;
+      list().update(clientMsgId, {
+        status: 'uploading',
+        body: {
+          image: {
+            fileId: '',
+            width: img.width,
+            height: img.height,
+            size: sizeOf(img.original.data),
+            mime: img.original.mime,
+          },
+        },
+      });
+      data = { kind: 'image', name: img.name || 'image', main: img.original, thumb: img.thumb };
+    } else {
+      const f = src.file!;
+      list().update(clientMsgId, { status: 'uploading' });
+      data = { kind: 'file', name: f.name, main: { data: f.data, mime: f.mime || 'application/octet-stream' } };
+    }
+    this.emitMessages(convId);
+    const total = sizeOf(data.main.data) + (data.thumb ? sizeOf(data.thumb.data) : 0);
+    const signal = job.abort.signal;
+    try {
+      const up = await files.createUpload(
+        {
+          kind: data.kind,
+          name: data.name,
+          size: sizeOf(data.main.data),
+          mime: data.main.mime,
+          ...(data.thumb ? { thumb: { size: sizeOf(data.thumb.data), mime: data.thumb.mime } } : {}),
+        },
+        signal,
+      );
+      job.fileId = up.fileId;
+      if (!alive()) return;
+      const mainSize = sizeOf(data.main.data);
+      await files.put(up.put, data.main.data, signal, (n) => src.onProgress?.(n, total));
+      if (data.thumb) {
+        if (!up.thumbPut) throw new UploadPutError(0);
+        if (!alive()) return;
+        await files.put(up.thumbPut, data.thumb.data, signal, (n) => src.onProgress?.(mainSize + n, total));
+      }
+      if (!alive()) return;
+      const done = await files.complete(up.fileId, signal);
+      job.completed = true;
+      if (!alive()) return;
+      const m = list().local(clientMsgId)!;
+      const body: Message['body'] =
+        data.kind === 'image'
+          ? {
+              image: {
+                ...m.body.image,
+                fileId: done.fileId,
+                size: done.size,
+                mime: done.mime,
+                ...(done.width ? { width: done.width, height: done.height } : {}),
+              },
+            }
+          : { file: { ...m.body.file, fileId: done.fileId, size: done.size, mime: done.mime } };
+      // 待发送（规则 1）：在线就发，否则排队，连上后按现有规则自动发一次（规则 3）。
+      if (this.conn.state === 'connected') {
+        list().update(clientMsgId, { body });
+        this.dispatch(convId, clientMsgId);
+      } else {
+        list().update(clientMsgId, { body, status: 'queued' });
+        this.emitMessages(convId);
+      }
+    } catch (err) {
+      if (!alive()) return;
+      // 没完成的上传尽力取消，立刻释放未完成名额（F-FILE-01 规则 6a）。
+      if (job.fileId && !job.completed) void files.cancelUpload(job.fileId);
+      if (err instanceof AccountError || err instanceof IMError) {
+        this.failAttachment(convId, clientMsgId, err.code, err instanceof AccountError ? err.reason : undefined);
+      } else {
+        this.failAttachment(convId, clientMsgId, 'network');
+      }
+    }
+  }
+
+  private failAttachment(convId: string, clientMsgId: string, error: MessageError, reason?: string): void {
+    const list = this.store.list(convId);
+    const m = list.local(clientMsgId);
+    if (!m || m.seq !== undefined || m.status === 'failed') return;
+    list.update(clientMsgId, { status: 'failed', error, errorReason: reason });
+    this.emitMessages(convId);
+    this.emit('sendFailed', convId, clientMsgId, error);
+  }
+
+  /** 附件消息还没有 fileId（没上传完）。 */
+  private needsUpload(m: Message): boolean {
+    return (m.type === 'image' && !m.body.image?.fileId) || (m.type === 'file' && !m.body.file?.fileId);
+  }
+
+  /**
    * 这个会话当前的禁言（PRD-admin F-ADM-40、41、42）：没有被禁言时为 null。
    * 按服务端时间判断到期；用户级优先，群内禁言只影响该群；全群禁言不限制群主、管理员。
    */
@@ -392,15 +697,35 @@ export class IMClient extends Emitter<ClientEvents> {
     return JSON.parse(JSON.stringify(this.store.debugExport())) as ReturnType<IMClient['debugExport']>;
   }
 
-  /** 手动重发失败的消息，沿用原来的 clientMsgId（PRD F-MSG-03 规则 2）。 */
+  /**
+   * 手动重发失败的消息，沿用原来的 clientMsgId（PRD F-MSG-03 规则 2）。
+   * 附件（F-FILE-07 规则 4）：已经 complete 的复用同一 fileId，不重传（AC-FILE-07-2）；没上传完的从头上传（新的 fileId）；
+   * 源已经不在的不动，error 改成 sourceMissing（"原文件已不可用，请重新选择"，只能删除）。
+   */
   retry(convId: string, clientMsgId: string): void {
     const m = this.store.list(convId).local(clientMsgId);
     if (!m || m.status !== 'failed') return;
+    if (this.needsUpload(m)) {
+      const src = this.sources.get(clientMsgId);
+      if (!src) {
+        this.store.list(convId).update(clientMsgId, { error: 'sourceMissing', errorReason: undefined });
+        this.emitMessages(convId);
+        return;
+      }
+      this.store.list(convId).update(clientMsgId, {
+        status: src.image || src.file ? 'uploading' : 'processing',
+        error: undefined,
+        errorReason: undefined,
+      });
+      this.emitMessages(convId);
+      this.enqueueUpload(convId, clientMsgId);
+      return;
+    }
     if (this.conn.state === 'connected') {
       this.dispatch(convId, clientMsgId);
     } else {
       this.autoUsed.add(clientMsgId); // 手动重发也只自动补发一次
-      this.store.list(convId).update(clientMsgId, { status: 'queued', error: undefined });
+      this.store.list(convId).update(clientMsgId, { status: 'queued', error: undefined, errorReason: undefined });
       this.emitMessages(convId);
     }
   }
@@ -411,6 +736,7 @@ export class IMClient extends Emitter<ClientEvents> {
    */
   removeFailed(convId: string, clientMsgId: string): boolean {
     if (!this.store.list(convId).removeFailed(clientMsgId)) return false;
+    this.sources.delete(clientMsgId);
     this.emitMessages(convId);
     return true;
   }
@@ -510,8 +836,10 @@ export class IMClient extends Emitter<ClientEvents> {
     this.mutesChanged();
     this.flushQueued();
     this.pushes.onAuth(a.userId, a.serverTime); // 不等 convs、socialSync，互不阻塞（AC-PUSH-03-24）
+    let convs: ServerConversation[] | null = null;
     try {
       const ack = await this.conn.request<ConvsAck>('convs', {});
+      convs = ack.convs;
       this.applyConvs(ack);
       for (const c of ack.convs) await this.catchUp(c);
       this.maybeReportRead();
@@ -521,20 +849,25 @@ export class IMClient extends Emitter<ClientEvents> {
     // 先 convs，再从本地 socialVer 开始一轮关系同步（F-SOC-06 规则 10）。
     this.social.needSync = true;
     void this.syncSocial();
-    void this.recheckDeleted();
+    void this.recheckDeleted(convs);
   }
 
   /**
-   * 重连后重新拉一遍已加载的范围：断开期间被删除的消息不会再发 msgDeleted，只有 sync 才能拿到（F-ADM-31 规则 5），
-   * 不拉的话内存里的原文会一直留着。首次连接没有已加载的消息，不发请求。
+   * 重连后重拉已加载的范围（F-RCL-03 规则 2）：只重拉 modVer 变了的会话（文件过期等），没变的不拉。
+   * 服务端没有 modVer（老服务端）或这次没拿到会话列表时，按原来的做法全部重拉：断开期间被删除的消息
+   * 不会再发 msgDeleted，只有 sync 才能拿到（F-ADM-31 规则 5）。首次连接没有已加载的消息，不发请求。
    */
-  private async recheckDeleted(): Promise<void> {
+  private async recheckDeleted(convs: ServerConversation[] | null): Promise<void> {
+    const byId = new Map((convs ?? []).map((c) => [c.convId, c]));
     for (const { convId, from, to } of this.store.loadedRanges()) {
+      const ver = byId.get(convId)?.modVer;
+      if (convs && byId.has(convId) && ver !== undefined && this.modVers.get(convId) === ver) continue;
       try {
         if (await this.syncAfter(convId, from - 1, to)) {
           this.emitMessages(convId);
           this.emitConversations();
         }
+        if (ver !== undefined) this.modVers.set(convId, ver);
       } catch (err) {
         this.log.warn(`im: recheck deleted failed: ${String(err)}`);
         return;
@@ -758,6 +1091,10 @@ export class IMClient extends Emitter<ClientEvents> {
     const gone = this.store.setConversations(ack.convs, ack.truncated);
     this.lastRefreshAt = this.clock.now();
     for (const c of ack.convs) {
+      // 还没加载过消息的会话：之后加载到的就是这个版本以后的内容，记下作为基线。已加载的等重拉成功再更新。
+      if (c.modVer !== undefined && !this.store.loadedRanges().some((r) => r.convId === c.convId)) {
+        this.modVers.set(c.convId, c.modVer);
+      }
       this.setGroupMute(c.convId, c.mutedUntil, c.allMuted);
       // 错过了 msgDeleted 的话，摘要是唯一的线索：本地已加载的那条也要清掉。
       if (c.lastMsg?.deleted && this.store.deleteMessages(c.convId, [c.lastMsg.msgId], [])) this.emitMessages(c.convId);
@@ -827,6 +1164,7 @@ export class IMClient extends Emitter<ClientEvents> {
   private failPending(convId: string): void {
     const list = this.store.list(convId);
     const pending = list.pendingMessages();
+    for (const m of pending) this.dropUploadJob(m.clientMsgId);
     for (const m of pending) list.update(m.clientMsgId, { status: 'failed', error: 'kicked' });
     if (pending.length) this.emitMessages(convId);
     for (const m of pending) this.emit('sendFailed', convId, m.clientMsgId, 'kicked');
@@ -841,7 +1179,15 @@ export class IMClient extends Emitter<ClientEvents> {
     this.emitMessages(convId);
     const { convType, to } = parseConvId(convId, this.self);
     const type = m.type;
+    // 附件只发 fileId，其他字段由服务端按记录填写（F-FILE-02 规则 1）。
+    const wire =
+      type === 'image'
+        ? { image: { fileId: m.body.image!.fileId } }
+        : type === 'file'
+          ? { file: { fileId: m.body.file!.fileId } }
+          : m.body;
     const onAck = (ack: SendAck) => {
+      this.sources.delete(clientMsgId); // 已发送：释放源（F-FILE-07 规则 2）
       // 正文在 ack 到的时候再取：等待期间消息可能已经被删除，回调不能留着一份原文。
       this.store.applyServerMessage({
         msgId: ack.msgId,
@@ -860,7 +1206,7 @@ export class IMClient extends Emitter<ClientEvents> {
     this.conn
       .request<SendAck>(
         'send',
-        { convType, to, clientMsgId, type: m.type, body: m.body },
+        { convType, to, clientMsgId, type: m.type, body: wire },
         {
           timeoutMs: this.t.sendTimeoutMs,
           // 超时后 ack 才到：以 ack 为准，变为已发送（C-30）。
@@ -875,6 +1221,10 @@ export class IMClient extends Emitter<ClientEvents> {
         // 失败回调是异步的：这期间消息可能已经被别的路径改过状态（例如被踢时标记为失败），只处理仍在发送中的。
         if (err instanceof IMError && err.code === ErrorCode.MUTED) this.onMutedAck(err.details);
         if (list.local(clientMsgId)?.status !== 'sending') return;
+        if (err instanceof IMError && err.code === ErrorCode.FILE_NOT_READY && (type === 'image' || type === 'file')) {
+          this.reupload(convId, clientMsgId);
+          return;
+        }
         if (err instanceof IMError) this.fail(convId, clientMsgId, err.code);
         else if (err instanceof TimeoutError) this.fail(convId, clientMsgId, 'timeout');
         else if (
@@ -887,6 +1237,26 @@ export class IMClient extends Emitter<ClientEvents> {
           this.emitMessages(convId);
         } else this.fail(convId, clientMsgId, 'timeout');
       });
+  }
+
+  /**
+   * send 返回 4096（文件超过 24 小时被清理，或已绑定别的消息）：有源的回到上传中、从头上传，不算自动重发次数（RC2-23）；
+   * 没有源的转失败，error=sourceMissing（F-FILE-07 规则 4，AC-FILE-07-10）。
+   */
+  private reupload(convId: string, clientMsgId: string): void {
+    const list = this.store.list(convId);
+    const m = list.local(clientMsgId)!;
+    const body: Message['body'] = m.body.image
+      ? { image: { ...m.body.image, fileId: '' } }
+      : { file: { ...m.body.file, fileId: '' } };
+    if (!this.sources.has(clientMsgId)) {
+      list.update(clientMsgId, { status: 'sending', body });
+      this.fail(convId, clientMsgId, 'sourceMissing');
+      return;
+    }
+    list.update(clientMsgId, { status: 'uploading', body, error: undefined, errorReason: undefined });
+    this.emitMessages(convId);
+    this.enqueueUpload(convId, clientMsgId);
   }
 
   private fail(convId: string, clientMsgId: string, error: Message['error']): void {
@@ -971,6 +1341,22 @@ export class IMClient extends Emitter<ClientEvents> {
     this.knownLists.add(convId);
     this.emit('messages', convId, this.store.messages(convId));
     this.emitPendingCount();
+    const expired = this.store.takeExpiredFiles();
+    if (expired.length) {
+      for (const id of expired) this.files?.forget(id);
+      this.emit('filesExpired', expired);
+    }
+  }
+
+  /** 中止这条消息的上传（排队的也拿掉）。没完成的发 DELETE。 */
+  private dropUploadJob(clientMsgId: string): void {
+    this.uploadQueue = this.uploadQueue.filter((q) => q.clientMsgId !== clientMsgId);
+    const job = this.job;
+    if (job?.clientMsgId !== clientMsgId) return;
+    job.abort.abort();
+    this.job = null;
+    if (job.fileId && !job.completed) void this.files?.cancelUpload(job.fileId);
+    this.pumpUploads();
   }
 
   private emitPendingCount(): void {
@@ -993,6 +1379,16 @@ export class IMClient extends Emitter<ClientEvents> {
     this.clearSocial();
     this.knownLists.clear();
     this.autoUsed.clear();
+    // 退出登录：上传中止，源和地址都只在内存里，丢掉（F-FILE-07 规则 2）。
+    this.uploadQueue = [];
+    if (this.job) {
+      this.job.abort.abort();
+      if (this.job.fileId && !this.job.completed) void this.files?.cancelUpload(this.job.fileId);
+    }
+    this.job = null;
+    this.sources.clear();
+    this.files?.clear();
+    this.modVers.clear();
     this.active = null;
     this.lastRead = -Infinity;
     this.emitConversations();

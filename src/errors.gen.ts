@@ -39,6 +39,7 @@ export const ErrorCode = {
   FRIEND_REQUEST_HANDLED: 4091,
   PUSH_ID_CONFLICT: 4094,
   USERNAME_TAKEN: 4095,
+  FILE_NOT_READY: 4096,
   GROUP_MEMBER_LIMIT_EXCEEDED: 4130,
   BATCH_LIMIT_EXCEEDED: 4131,
   FRIEND_LIMIT_EXCEEDED: 4132,
@@ -47,11 +48,14 @@ export const ErrorCode = {
   JOINED_GROUP_LIMIT_EXCEEDED: 4135,
   GROUP_ADMIN_LIMIT_EXCEEDED: 4136,
   STRANGER_MSG_LIMIT: 4137,
+  FILE_TOO_LARGE: 4139,
+  FILE_TYPE_NOT_ALLOWED: 4150,
   RATE_LIMITED: 4290,
   QUOTA_EXCEEDED: 4292,
   ACCOUNT_LOGIN_LOCKED: 4294,
   INTERNAL: 5000,
   SERVICE_UNAVAILABLE: 5030,
+  OBJECT_STORE_UNAVAILABLE: 5032,
 } as const;
 export type ErrorCode = (typeof ErrorCode)[keyof typeof ErrorCode];
 
@@ -94,6 +98,7 @@ export const ERROR_INFO: Readonly<Record<number, { name: string; retryable: bool
   4091: { name: "FRIEND_REQUEST_HANDLED", retryable: false, message: "申请已同意" },
   4094: { name: "PUSH_ID_CONFLICT", retryable: false, message: "同一 pushId 的调用方或内容不同" },
   4095: { name: "USERNAME_TAKEN", retryable: false, message: "用户名已存在或保留" },
+  4096: { name: "FILE_NOT_READY", retryable: false, message: "文件未完成上传，或已绑定其他消息" },
   4130: { name: "GROUP_MEMBER_LIMIT_EXCEEDED", retryable: false, message: "群成员已达上限" },
   4131: { name: "BATCH_LIMIT_EXCEEDED", retryable: false, message: "单次批量操作数量超限" },
   4132: { name: "FRIEND_LIMIT_EXCEEDED", retryable: false, message: "好友数量已达上限" },
@@ -102,11 +107,14 @@ export const ERROR_INFO: Readonly<Record<number, { name: string; retryable: bool
   4135: { name: "JOINED_GROUP_LIMIT_EXCEEDED", retryable: false, message: "加入的群聊已达上限" },
   4136: { name: "GROUP_ADMIN_LIMIT_EXCEEDED", retryable: false, message: "管理员已满 10 人" },
   4137: { name: "STRANGER_MSG_LIMIT", retryable: false, message: "对方回复前的条数已用完" },
+  4139: { name: "FILE_TOO_LARGE", retryable: false, message: "超过大小限制（details.maxBytes）" },
+  4150: { name: "FILE_TYPE_NOT_ALLOWED", retryable: false, message: "禁止的类型或内容与声明不符" },
   4290: { name: "RATE_LIMITED", retryable: true, message: "操作过于频繁" },
   4292: { name: "QUOTA_EXCEEDED", retryable: false, message: "今天的次数已用完" },
   4294: { name: "ACCOUNT_LOGIN_LOCKED", retryable: false, message: "尝试过多，暂时锁定（details.retryAfterSeconds）" },
   5000: { name: "INTERNAL", retryable: true, message: "服务器内部错误" },
   5030: { name: "SERVICE_UNAVAILABLE", retryable: true, message: "服务暂不可用" },
+  5032: { name: "OBJECT_STORE_UNAVAILABLE", retryable: true, message: "对象存储暂不可用（reason: completeInProgress 是同一上传的 complete 正在进行）" },
 };
 
 /** client scope 的错误码：账号和文件的 HTTP 接口会返回（PRD-chat 第 11.5 节，F-SYS-01）。 */
@@ -122,20 +130,26 @@ export const CLIENT_ERROR_CODES: readonly number[] = [
   4030,
   4034,
   4095,
+  4096,
+  4131,
+  4139,
+  4150,
   4290,
   4292,
   4294,
   5000,
   5030,
+  5032,
 ];
 
 /** 错误码 → 细分的 reason（PRD-chat 第 11.5 节）。收到没有列出的 reason 不能报错。 */
 export const ERROR_REASONS: Readonly<Record<number, readonly string[]>> = {
-  4000: ["passwordWeak","recoveryCodeStale"],
+  4000: ["passwordWeak","recoveryCodeStale","fileKindMismatch","uploadMismatch","fileNameTooLong"],
   4011: ["tokenSuperseded"],
   4019: ["invalid","expired","revoked","superseded","replayDetected","credentialsChanged","loggedOutOthers","accountDeleted"],
   4030: ["registerClosed","inviteInvalid","accountSessionRequired","accountExists","accountDeletionPending","featureDisabled"],
-  4290: ["recoverLimited"],
+  4290: ["recoverLimited","uploadPendingLimit"],
+  5032: ["completeInProgress"],
 };
 
 /** WebSocket 关闭码。 */

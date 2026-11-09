@@ -5,6 +5,7 @@ import { existsSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 export const ADMIN_KEY = 'sdk-it-admin-key-0123456789abcdef';
 // 只给这个测试服务端用的调用方（PRD-admin F-KEY-02）：第二批管理接口不接受旧 X-Admin-Key。
@@ -28,6 +29,48 @@ export const MODERATION_ENV = {
   IM_V13_ADMIN_FEATURES: '1',
   IM_QUARANTINE_KEY: 'sdk-it-quarantine-key-0123456789abcdef',
 };
+
+/** 假 S3（test/integration/fake_s3.py，只监听 127.0.0.1，标准库 Python）。 */
+export interface FakeS3 {
+  endpoint: string;
+  /** 打开文件功能（IM_FILES_ENABLED）需要的环境变量。 */
+  env: Record<string, string>;
+  stop(): Promise<void>;
+}
+
+export async function startFakeS3(): Promise<FakeS3> {
+  const script = fileURLToPath(new URL('./fake_s3.py', import.meta.url));
+  const proc = spawn('python3', ['-I', script], { stdio: ['pipe', 'pipe', 'ignore'] });
+  const port = await new Promise<number>((resolvePort, reject) => {
+    let buf = '';
+    proc.stdout!.on('data', (d: Buffer) => {
+      buf += d.toString();
+      const m = /port (\d+)/.exec(buf);
+      if (m) resolvePort(Number(m[1]));
+    });
+    proc.once('exit', () => reject(new Error('fake S3 exited')));
+  });
+  const endpoint = `http://127.0.0.1:${port}`;
+  return {
+    endpoint,
+    env: {
+      IM_FILES_ENABLED: '1',
+      IM_OBJSTORE_ENDPOINT: endpoint,
+      IM_OBJSTORE_REGION: 'us-east-1',
+      IM_OBJSTORE_BUCKET: 'chat',
+      IM_OBJSTORE_PUBLIC_BUCKET: 'avatars',
+      IM_OBJSTORE_PUBLIC_BASE_URL: `${endpoint}/avatars`,
+      IM_OBJSTORE_ACCESS_KEY: 'sdk-it-access',
+      IM_OBJSTORE_SECRET_KEY: 'sdk-it-secret-not-real',
+    },
+    stop: () =>
+      new Promise((done) => {
+        proc.once('exit', () => done());
+        proc.stdin!.end(); // 假 S3 在 stdin 关闭时退出
+        proc.kill('SIGTERM');
+      }),
+  };
+}
 
 /** 打开系统推送（IM_PUSH_ENABLED，默认关闭）。 */
 export const PUSH_ENV = { IM_PUSH_ENABLED: '1' };

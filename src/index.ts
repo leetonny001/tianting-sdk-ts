@@ -1,6 +1,7 @@
 // IM 统一 SDK（TypeScript）。对外接口见 docs/sdk/README.md。
 export {
   IMClient,
+  type AttachmentOptions,
   type ApplyFriendOptions,
   type IMClientOptions,
   type IMClientTimings,
@@ -53,7 +54,31 @@ export {
 } from './social.js';
 export type { ConnState, FatalReason } from './connection.js';
 export { ConnectionClosedError, NotConnectedError, TimeoutError } from './connection.js';
-export type { Conversation, ConversationSnapshot, Message, MessageStatus } from './store.js';
+export type { Conversation, ConversationSnapshot, Message, MessageError, MessageStatus } from './store.js';
+export { fileExpired } from './store.js';
+export {
+  COMPLETE_RETRIES,
+  FetchUploadTransport,
+  FileClient,
+  StaticTokenAuth,
+  UploadPutError,
+  URLS_BATCH,
+  XhrUploadTransport,
+  type CompleteResponse,
+  type FileAuth,
+  type FileClientOptions,
+  type FileInput,
+  type FileUrlItem,
+  type FileUrlResult,
+  type FileVariant,
+  type PresignedPut,
+  type ProcessedImage,
+  type UploadBody,
+  type UploadData,
+  type UploadRequest,
+  type UploadResponse,
+  type UploadTransport,
+} from './files.js';
 export type { MuteInfo } from './mute.js';
 export { PUSH_DEFAULTS, type Push, type PushLimits, type PushStart } from './push.js';
 export { avatarColorIndex, avatarInitial, fnv1a32 } from './avatar.js';
@@ -77,7 +102,11 @@ export {
   parseConvIdStrict,
   peerId,
   type ConvType,
+  type FileBody,
   type GroupRole,
+  type ImageBody,
+  type MsgBody,
+  type MsgType,
   type TipBody,
   type Platform,
 } from './protocol.js';

@@ -1,8 +1,20 @@
-import type { ConvType, GroupRole, LastMsg, MsgBody, ServerConversation, ServerMessage } from './protocol.js';
+import type { ConvType, GroupRole, LastMsg, MsgBody, MsgType, ServerConversation, ServerMessage } from './protocol.js';
 import { countCodePoints } from './text.js';
 
-/** 发送状态（PRD F-MSG-03）。queued：离线时进入待发队列；服务端来的消息都是 sent。 */
-export type MessageStatus = 'queued' | 'sending' | 'sent' | 'failed';
+/**
+ * 发送状态（PRD F-MSG-03；附件见 PRD-chat F-FILE-07）。服务端来的消息都是 sent。
+ * 附件：processing（App 在处理图片）→ uploading（申请、PUT、complete）→ queued（待发送：已 complete，等连接）→ sending → sent；
+ * 任何一步可以转 failed。文本没有前两种。
+ */
+export type MessageStatus = 'processing' | 'uploading' | 'queued' | 'sending' | 'sent' | 'failed';
+
+/**
+ * 发送失败的原因：服务端错误码（4292 上传额度用完、4290 + errorReason=uploadPendingLimit、4139、4150、4096、5032…），
+ * 或者 timeout（10 秒没有 ack）、kicked（被踢）、network（上传时网络或对象存储出错）、
+ * process（App 处理图片失败：提示"无法处理这张图片，请用文件方式发送"）、
+ * sourceMissing（要重新上传但原文件已不在：提示"原文件已不可用，请重新选择"）。
+ */
+export type MessageError = number | 'timeout' | 'kicked' | 'network' | 'process' | 'sourceMissing';
 
 /** 界面看到的一条消息。待发 / 失败的消息还没有 msgId 和 seq。 */
 export interface Message {
@@ -11,13 +23,15 @@ export interface Message {
   seq?: number;
   convId: string;
   from: string;
-  type: 'text' | 'custom' | 'tip';
+  type: MsgType;
   body: MsgBody;
   /** 服务端时间；待发消息用本地时间临时展示（PRD 3.1）。 */
   ts: number;
   status: MessageStatus;
-  /** 发送失败的原因：错误码，或 "timeout" / "kicked"。 */
-  error?: number | 'timeout' | 'kicked';
+  /** 发送失败的原因，见 MessageError。 */
+  error?: MessageError;
+  /** 错误码的 reason（例如 4290 的 uploadPendingLimit）。 */
+  errorReason?: string;
   /** 被删除（PRD-admin F-ADM-31）：seq、msgId、发送者、时间都保留，body 为空对象。 */
   deleted?: boolean;
   deletedAt?: number;
@@ -38,6 +52,8 @@ export interface Conversation {
   memberCount?: number;
   /** 群里我的角色（M4）；单聊和旧服务端没有。 */
   myRole?: GroupRole;
+  /** 已有消息展示内容的版本号（F-RCL-03 规则 2）；老服务端没有。 */
+  modVer?: number;
 }
 
 /**
@@ -64,6 +80,18 @@ function deletedLast(m: { msgId: string; from: string; type: string; ts: number 
   return { msgId: m.msgId, from: m.from, type: m.type, ts: m.ts, deleted: true };
 }
 
+/** 图片或文件已过期（F-FILE-06 规则 3）。 */
+export function fileExpired(body: MsgBody | undefined): boolean {
+  return body?.image?.expired === true || body?.file?.expired === true;
+}
+
+/** 过期后的内容：标记 expired，文件名清空（服务端同样清空，F-FILE-06 规则 3）。 */
+function expireBody(body: MsgBody): MsgBody {
+  if (body.image) return { ...body, image: { ...body.image, expired: true } };
+  if (body.file) return { ...body, file: { ...body.file, expired: true, name: '' } };
+  return body;
+}
+
 function summary(text: string): string {
   if (countCodePoints(text) <= SUMMARY_LEN) return text;
   return Array.from(text).slice(0, SUMMARY_LEN).join('');
@@ -78,6 +106,10 @@ class MessageList {
   // 已知被删除的 msgId / seq：之后才到的 sync 结果、发送 ack 带着原文也不能写回来。
   private deletedIds = new Set<string>();
   private deletedSeqs = new Set<number>();
+  // 已知文件已过期的 msgId（F-FILE-06 规则 3）：expired 只能从假变真，迟到的旧 sync 不能把它改回去（F-RCL-03 规则 2a）。
+  private expiredIds = new Set<string>();
+  /** 这次合并里刚变成过期的 fileId，由 Store 取走（清缓存用）。 */
+  newlyExpired: string[] = [];
   // 本地删除过的失败消息（G-UI-14）：它可能其实到了服务端，之后的 ack、sync 不能让它再出现。
   /** 用户删掉的失败消息：clientMsgId → 发送者。clientMsgId 只在同一发送者内唯一，别人用同样的值不能被拦。 */
   private removedClient = new Map<string, string>();
@@ -88,22 +120,33 @@ class MessageList {
 
   /**
    * 合并服务端消息；按 msgId 去重，按 clientMsgId 合并本地待发消息。
-   * 已有的消息只会变成已删除。返回合并后的消息，没有变化时为 null。
+   * 已有的消息单调合并（F-RCL-03 规则 2a）：deleted、文件的 expired 只能从假变真，deletedIds 优先；
+   * 迟到的旧 sync 应答带着原文或 expired=false 时不回写。返回合并后的消息，没有变化时为 null。
    */
   addServer(m: ServerMessage): Message | null {
     if (this.removedClient.get(m.clientMsgId) === m.from) return null;
     const deleted = m.deleted === true || this.isDeleted(m.msgId, m.seq);
     if (this.byMsgId.has(m.msgId)) {
       const old = this.bySeq.get(m.seq);
-      return deleted && old && !old.deleted ? this.wipe(old, m.deletedAt) : null;
+      if (!old || old.deleted) return null;
+      if (deleted) return this.wipe(old, m.deletedAt);
+      if (fileExpired(m.body) && !fileExpired(old.body)) {
+        this.expiredIds.add(m.msgId);
+        return this.replace(old, { ...old, body: expireBody(old.body) });
+      }
+      return null;
     }
     const local = this.byClient.get(m.clientMsgId);
     if (local && local.seq === undefined && local.from === m.from) {
       this.unsent = this.unsent.filter((x) => x !== local);
     }
-    const msg: Message = deleted
-      ? { ...m, body: {}, deleted: true, status: 'sent' }
-      : { ...m, body: m.body ?? {}, status: 'sent' };
+    let body = m.body ?? {};
+    if (!deleted && (fileExpired(body) || this.expiredIds.has(m.msgId))) {
+      if (!this.expiredIds.has(m.msgId)) this.noteExpired(body);
+      this.expiredIds.add(m.msgId);
+      body = expireBody(body);
+    }
+    const msg: Message = deleted ? { ...m, body: {}, deleted: true, status: 'sent' } : { ...m, body, status: 'sent' };
     this.bySeq.set(m.seq, msg);
     this.byClient.set(m.clientMsgId, msg);
     this.byMsgId.add(m.msgId);
@@ -132,9 +175,20 @@ class MessageList {
   private wipe(old: Message, deletedAt?: number): Message {
     const next: Message = { ...old, body: {}, deleted: true };
     if (deletedAt !== undefined) next.deletedAt = deletedAt;
+    this.noteExpired(old.body); // 文件的缓存同样要清（F-RCL-03 规则 3）
+    return this.replace(old, next);
+  }
+
+  private replace(old: Message, next: Message): Message {
+    if (next.body !== old.body && fileExpired(next.body)) this.noteExpired(old.body);
     this.bySeq.set(old.seq!, next);
     this.byClient.set(old.clientMsgId, next);
     return next;
+  }
+
+  private noteExpired(body: MsgBody): void {
+    const id = body.image?.fileId || body.file?.fileId;
+    if (id && !this.newlyExpired.includes(id)) this.newlyExpired.push(id);
   }
 
   /** 是否有还没有 seq 的本地消息（待发 / 失败），它们可能正是服务端已经存下的某一条。 */
@@ -158,8 +212,13 @@ class MessageList {
 
   /** 移除一条失败的本地消息，并记住它的 clientMsgId。不是失败状态时不动，返回 false。 */
   removeFailed(clientMsgId: string): boolean {
+    return this.removeUnsent(clientMsgId, ['failed']);
+  }
+
+  /** 移除一条还没有 seq、状态在 statuses 里的本地消息（取消上传，F-FILE-07、AC-FILE-02-5），并记住 clientMsgId。 */
+  removeUnsent(clientMsgId: string, statuses: readonly MessageStatus[]): boolean {
     const m = this.byClient.get(clientMsgId);
-    if (!m || m.status !== 'failed' || m.seq !== undefined) return false;
+    if (!m || !statuses.includes(m.status) || m.seq !== undefined) return false;
     this.unsent = this.unsent.filter((x) => x !== m);
     this.byClient.delete(clientMsgId);
     this.removedClient.set(clientMsgId, m.from);
@@ -190,12 +249,20 @@ class MessageList {
     this.hasMoreHistory = true;
   }
 
+  /** 还在进行中的本地消息（处理、上传、排队、发送中）。 */
   pendingMessages(): Message[] {
-    return this.unsent.filter((m) => m.status === 'queued' || m.status === 'sending');
+    return this.unsent.filter((m) => m.status !== 'failed' && m.status !== 'sent');
   }
 
   snapshot(): Message[] {
     return [...[...this.bySeq.values()].sort((a, b) => a.seq! - b.seq!), ...this.unsent];
+  }
+
+  hasExpiredFile(fileId: string): boolean {
+    for (const m of this.bySeq.values()) {
+      if ((m.body.image?.fileId === fileId || m.body.file?.fileId === fileId) && fileExpired(m.body)) return true;
+    }
+    return false;
   }
 
   get maxLoadedSeq(): number {
@@ -378,6 +445,22 @@ export class Store {
       c.lastMsg = deletedLast(c.lastMsg);
     }
     return changed;
+  }
+
+  /** 取走合并时刚变成过期（或被删除）的文件的 fileId：调用方清地址和文件缓存（F-FILE-06 规则 3、AC-FILE-06-12）。 */
+  takeExpiredFiles(): string[] {
+    const out: string[] = [];
+    for (const l of this.msgs.values()) {
+      out.push(...l.newlyExpired);
+      l.newlyExpired = [];
+    }
+    return out;
+  }
+
+  /** 这条消息的文件是否已知过期（申请地址前看一眼，AC-FILE-06-6：不发申请地址的请求）。 */
+  fileExpired(fileId: string): boolean {
+    for (const l of this.msgs.values()) if (l.hasExpiredFile(fileId)) return true;
+    return false;
   }
 
   /** 已加载过服务端消息的会话和已加载的 seq 范围。 */

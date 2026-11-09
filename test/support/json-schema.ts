@@ -99,6 +99,9 @@ export class SchemaValidator {
             }
           }
           break;
+        case 'propertyNames':
+          if (obj) for (const p of Object.keys(obj)) this.check(arg as Schema, p, `${at}{${p}}`, out);
+          break;
         case 'additionalProperties':
           if (obj) {
             const known = (schema['properties'] ?? {}) as Record<string, Json>;

@@ -1,10 +1,10 @@
 // TC-CHAT-90-09（AC-CHAT-90-10，sdk-ts 部分）：账号接口的请求和 http-client.schema.json 一致。
 import { describe, expect, it } from 'vitest';
-import { accountSetup, httpSchema, httpValidator } from './support/account.js';
+import { accountSetup, endpointKey, httpSchema, httpValidator } from './support/account.js';
 import { flush } from './helpers.js';
 
 describe('TC-CHAT-90-09 http-client.schema.json', () => {
-  it('AccountClient 的 14 个接口都在 endpoints 里，请求体符合 Schema', async () => {
+  it('AccountClient 的 14 个接口和 FileClient 的 4 个文件接口都在 endpoints 里，请求体符合 Schema', async () => {
     const h = accountSetup();
     h.session(1, 24 * 3_600_000);
     const a = h.account;
@@ -15,6 +15,17 @@ describe('TC-CHAT-90-09 http-client.schema.json', () => {
       a.regenerateRecoveryCode('Password-1'),
       a.ackRecoveryCode(2),
       a.cancelDelete('alice_1', 'Password-1'),
+      // 文件接口（FE-630，F-FILE-01、04）：经过 AccountClient.authorized 带 Bearer。
+      h.files.createUpload({
+        kind: 'image',
+        name: 'a.jpg',
+        size: 10,
+        mime: 'image/jpeg',
+        thumb: { size: 5, mime: 'image/jpeg' },
+      }),
+      h.files.complete('F1'),
+      h.files.cancelUpload('F1'),
+      h.files.getFileUrls([{ fileId: 'F1', variant: 'thumb' }]),
     ];
     calls.forEach((p) => p.catch(() => undefined));
     await flush();
@@ -40,7 +51,7 @@ describe('TC-CHAT-90-09 http-client.schema.json', () => {
     await flush();
     h.http.pending[0]!.respond(200, {});
     await logout;
-    const seen = new Set(h.http.calls.map((c) => `${c.req.method} ${c.path}`));
+    const seen = new Set(h.http.calls.map((c) => endpointKey(c.req.method, c.path) ?? `${c.req.method} ${c.path}`));
     const missing = Object.keys(httpSchema.endpoints).filter((e) => !seen.has(e) && !e.endsWith('/token/refresh'));
     expect(missing).toEqual([]);
     expect(h.badRequests).toEqual([]);

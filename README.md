@@ -95,6 +95,26 @@ await account.requestDelete(pw); await account.cancelDelete(username, pw);
 错误：`AccountError`（`status`、`code`、`reason`、`details`）、`AccountNetworkError`、`AccountTimeoutError`（30 秒，迟到的响应被丢弃）、`SessionEndedError`。
 测试替身：`@tianting/sdk/testing` 的 `FakeHttp`，配合 `FakeTransport`、`FakeClock`。
 
+## 图片和文件（PRD-chat C2）
+
+```ts
+const files = new FileClient({ auth: account, upload: new XhrUploadTransport() }); // 演示模式：new StaticTokenAuth(baseUrl, token)
+const im = new IMClient({ url, files });
+// 图片处理（压缩、缩略图 ≤ 480、去 EXIF）在 App 里做；可以传处理好的结果，也可以传一个函数，轮到它时才调用（并发 1）
+const m = im.sendImage(convId, () => processInCanvas(file), { onProgress: (sent, total) => …, signal });
+im.sendFile(convId, { data: file, name: file.name, mime: file.type });
+im.cancelUpload(convId, m.clientMsgId);         // 中止上传、发 DELETE、消息消失；已经在 send 的不能取消
+im.retry(convId, clientMsgId);                  // 已 complete 的复用 fileId；没传完的从头传；没有源时 error = 'sourceMissing'
+const [r] = await im.getFileUrls([{ fileId, variant: 'thumb' }]); // 同一事件循环内合并成一批（≤ 50），没到期的地址用缓存
+im.on('filesExpired', (fileIds) => …);         // 过期或被删：清掉 App 按 fileId + variant 缓存的图片
+```
+
+状态：`processing` → `uploading` → `queued`（待发送，已 complete）→ `sending` → `sent`，任何一步可以 `failed`。
+`error`：错误码（4292 额度用完、4290 + `errorReason: 'uploadPendingLimit'`、4139、4150、4096、5032），或 `network`、`process`、`timeout`、`kicked`、`sourceMissing`。
+4292、`uploadPendingLimit` 不自动重试；`complete` 的 5032 退避重试 3 次；`send` 返回 4096 时有源的回到上传中重新上传。
+源（File / Blob）只在内存里，发出后释放，刷新就没有了。预签名地址和文件名不进日志。
+重连时只重拉 `modVer` 变了的会话（服务端没有 `modVer` 时全部重拉）；`deleted`、`expired` 只能从假变真。
+
 ## 删除失败的消息（PRD-ui G-UI-14）
 
 ```ts
@@ -122,7 +142,7 @@ scripts/sync-protocol.sh       # 默认从同级目录 ../tianting-server 同步
 
 ## 集成测试
 
-集成测试会编译并启动真实的服务端，需要 Go 1.27+ 和 tianting-server 的源码：
+集成测试会编译并启动真实的服务端，需要 Go 1.27+ 和 tianting-server 的源码；文件用例另外启动 `test/integration/fake_s3.py`（标准库 Python 3，只监听 127.0.0.1，不验签名，只验调度逻辑）：
 
 ```bash
 npm run test:integration       # 默认找同级目录 ../tianting-server/server
