@@ -280,6 +280,8 @@ export class IMClient extends Emitter<ClientEvents> {
   private unsubscribeProvider: Array<() => void> = [];
   private readonly files: FileClient | null;
   private sources = new Map<string, AttachmentSource>(); // clientMsgId → 源
+  /** 这台设备自己上传、complete 成功的 fileId（F-FILE-07 规则 4，v1.4）：send 回 4048 时只有这些按已清理处理。退出登录清空。 */
+  private ownFileIds = new Set<string>();
   private uploadQueue: Array<{ convId: string; clientMsgId: string }> = [];
   private job: UploadJob | null = null;
   /** 最近一次重拉时各会话的 modVer（F-RCL-03 规则 2）：变了才重拉这个会话的已加载范围。 */
@@ -634,6 +636,7 @@ export class IMClient extends Emitter<ClientEvents> {
       if (!alive()) return;
       const done = await files.complete(up.fileId, signal);
       job.completed = true;
+      this.ownFileIds.add(done.fileId);
       if (!alive()) return;
       const m = list().local(clientMsgId)!;
       const body: Message['body'] =
@@ -1221,7 +1224,11 @@ export class IMClient extends Emitter<ClientEvents> {
         // 失败回调是异步的：这期间消息可能已经被别的路径改过状态（例如被踢时标记为失败），只处理仍在发送中的。
         if (err instanceof IMError && err.code === ErrorCode.MUTED) this.onMutedAck(err.details);
         if (list.local(clientMsgId)?.status !== 'sending') return;
-        if (err instanceof IMError && err.code === ErrorCode.FILE_NOT_READY && (type === 'image' || type === 'file')) {
+        if (
+          err instanceof IMError &&
+          (type === 'image' || type === 'file') &&
+          this.purgedOnServer(err.code, list.local(clientMsgId)!)
+        ) {
           this.reupload(convId, clientMsgId);
           return;
         }
@@ -1240,7 +1247,18 @@ export class IMClient extends Emitter<ClientEvents> {
   }
 
   /**
-   * send 返回 4096（文件超过 24 小时被清理，或已绑定别的消息）：有源的回到上传中、从头上传，不算自动重发次数（RC2-23）；
+   * send 的错误是不是"文件已被清理"（F-FILE-07 规则 4）：4096；或者 4048 且 fileId 是这台设备自己上传得到的
+   * （24 小时没绑定的上传被 file_purge 删了行，服务端分不清，v1.4，P-37 ①）。别人的 fileId（转发等）回 4048 照常失败。
+   */
+  private purgedOnServer(code: number, m: Message): boolean {
+    if (code === ErrorCode.FILE_NOT_READY) return true;
+    if (code !== ErrorCode.FILE_NOT_FOUND) return false;
+    const fileId = m.body.image?.fileId || m.body.file?.fileId;
+    return !!fileId && this.ownFileIds.has(fileId);
+  }
+
+  /**
+   * send 返回 4096（文件超过 24 小时被清理，或已绑定别的消息），或自己上传的 fileId 返回 4048：有源的回到上传中、从头上传，不算自动重发次数（RC2-23）；
    * 没有源的转失败，error=sourceMissing（F-FILE-07 规则 4，AC-FILE-07-10）。
    */
   private reupload(convId: string, clientMsgId: string): void {
@@ -1387,6 +1405,7 @@ export class IMClient extends Emitter<ClientEvents> {
     }
     this.job = null;
     this.sources.clear();
+    this.ownFileIds.clear();
     this.files?.clear();
     this.modVers.clear();
     this.active = null;

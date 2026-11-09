@@ -111,7 +111,7 @@ im.on('filesExpired', (fileIds) => …);         // 过期或被删：清掉 App
 
 状态：`processing` → `uploading` → `queued`（待发送，已 complete）→ `sending` → `sent`，任何一步可以 `failed`。
 `error`：错误码（4292 额度用完、4290 + `errorReason: 'uploadPendingLimit'`、4139、4150、4096、5032），或 `network`、`process`、`timeout`、`kicked`、`sourceMissing`。
-4292、`uploadPendingLimit` 不自动重试；`complete` 的 5032 退避重试 3 次；`send` 返回 4096 时有源的回到上传中重新上传。
+4292、`uploadPendingLimit` 不自动重试；`complete` 的 5032 退避重试 3 次；`send` 返回 4096 时有源的回到上传中重新上传；返回 4048 时，只有这台设备自己上传（`complete` 成功）的 `fileId` 同样处理，别人的 `fileId`（转发等）照常失败（PRD-chat v1.4 F-FILE-07 规则 4）。
 源（File / Blob）只在内存里，发出后释放，刷新就没有了。预签名地址和文件名不进日志。
 重连时只重拉 `modVer` 变了的会话（服务端没有 `modVer` 时全部重拉）；`deleted`、`expired` 只能从假变真。
 

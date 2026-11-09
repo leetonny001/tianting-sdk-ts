@@ -478,6 +478,85 @@ describe('TC-FILE-07-10 send 返回 4096：有源的回到上传中重新上传�
   });
 });
 
+describe('TC-FILE-07-10 send 返回 4048（v1.4，P-37 ①）：只有这台设备自己上传的 fileId 按已清理处理', () => {
+  /** 测试用：直接拿 SDK 内部的消息仓库和源（TS 没有转发入口，造一条带别人 fileId 的待发消息只能这样）。 */
+  const internals = (h: AccountHarness) =>
+    h.im as unknown as {
+      store: { list(convId: string): { addLocal(m: Message): void } };
+      sources: Map<string, unknown>;
+    };
+
+  it('自己上传的图片：回到上传中，用内存里的源重新上传（新 fileId），clientMsgId 不变，不占自动重发次数', async () => {
+    const { h, c } = await online();
+    h.im.sendImage(AB, image());
+    await uploadOk(h, 'F1');
+    c.ackError('send', 4048);
+    await flush();
+    expect(status(h)).toEqual(['cid-0001:uploading']);
+    expect(h.im.messages(AB)[0]!.body.image!.fileId).toBe('');
+    expect(h.http.to(UPLOADS)).toHaveLength(2); // 重新申请上传
+    await uploadOk(h, 'F2');
+    expect(c.last('send').data).toMatchObject({ clientMsgId: 'cid-0001', body: { image: { fileId: 'F2' } } });
+    c.ack('send', { msgId: 'm1', convId: AB, seq: 1, ts: 9 });
+    await flush();
+    expect(status(h)).toEqual(['cid-0001:sent#1']);
+  });
+
+  it('自己上传的文件：同样重新上传；重新上传后又断线，重连还会自动补发一次（4048 那一次没占用）', async () => {
+    const { h, c } = await online();
+    h.im.sendFile(AB, { data: new Uint8Array(10), name: SECRET_NAME, mime: 'application/pdf' });
+    await uploadOk(h, 'F1', false);
+    c.ackError('send', 4048);
+    await flush();
+    expect(status(h)).toEqual(['cid-0001:uploading']);
+    await uploadOk(h, 'F2', false);
+    expect(c.last('send').data).toMatchObject({ clientMsgId: 'cid-0001', body: { file: { fileId: 'F2' } } });
+    c.drop(1006);
+    await flush();
+    expect(status(h)).toEqual(['cid-0001:queued']);
+    h.clock.advance(1_000);
+    await flush();
+    const c2 = await h.login(USER);
+    expect(c2.last('send').data).toMatchObject({ clientMsgId: 'cid-0001', body: { file: { fileId: 'F2' } } });
+  });
+
+  it('自己上传的，但源已经不在：转失败 sourceMissing，不申请上传', async () => {
+    const { h, c } = await online();
+    h.im.sendImage(AB, image());
+    await uploadOk(h, 'F1');
+    internals(h).sources.delete('cid-0001');
+    c.ackError('send', 4048);
+    await flush();
+    expect(status(h)).toEqual(['cid-0001:failed(sourceMissing)']);
+    expect(h.http.to(UPLOADS)).toHaveLength(1);
+  });
+
+  it('别人的 fileId（不是这台设备上传的，例如转发）：4048 照常失败，不重新上传', async () => {
+    const { h, c } = await online();
+    internals(h)
+      .store.list(AB)
+      .addLocal({
+        clientMsgId: 'fwd-1',
+        convId: AB,
+        from: USER,
+        type: 'image',
+        body: { image: { fileId: 'F-OTHER', width: 10, height: 10, size: 100, mime: 'image/jpeg' } },
+        ts: 1,
+        status: 'failed',
+        error: 'timeout',
+      });
+    h.im.retry(AB, 'fwd-1');
+    await flush();
+    expect(c.last('send').data).toMatchObject({ clientMsgId: 'fwd-1', body: { image: { fileId: 'F-OTHER' } } });
+    c.ackError('send', 4048);
+    await flush();
+    expect(status(h)).toEqual(['fwd-1:failed(4048)']);
+    expect(h.im.messages(AB)[0]!.body.image!.fileId).toBe('F-OTHER');
+    expect(h.http.to(UPLOADS)).toHaveLength(0);
+    expect(h.upload.calls).toHaveLength(0);
+  });
+});
+
 describe('被踢、退出时的上传', () => {
   it('被踢：上传中的中止，标记失败（kicked）', async () => {
     const { h, c } = await online();
