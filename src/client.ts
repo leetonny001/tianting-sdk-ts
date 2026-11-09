@@ -859,6 +859,7 @@ export class IMClient extends Emitter<ClientEvents> {
    * 重连后重拉已加载的范围（F-RCL-03 规则 2）：只重拉 modVer 变了的会话（文件过期等），没变的不拉。
    * 服务端没有 modVer（老服务端）或这次没拿到会话列表时，按原来的做法全部重拉：断开期间被删除的消息
    * 不会再发 msgDeleted，只有 sync 才能拿到（F-ADM-31 规则 5）。首次连接没有已加载的消息，不发请求。
+   * 按会话依次重拉；一个失败只影响它自己（P-39 ②）：不记新的 modVer，下次重连再拉，其余会话照拉。
    */
   private async recheckDeleted(convs: ServerConversation[] | null): Promise<void> {
     const byId = new Map((convs ?? []).map((c) => [c.convId, c]));
@@ -873,7 +874,6 @@ export class IMClient extends Emitter<ClientEvents> {
         if (ver !== undefined) this.modVers.set(convId, ver);
       } catch (err) {
         this.log.warn(`im: recheck deleted failed: ${String(err)}`);
-        return;
       }
     }
   }

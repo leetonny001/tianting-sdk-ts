@@ -795,6 +795,48 @@ describe('TC-FILE-06-11 过期递增 modVer：只重拉这个会话，变"已过
     expect(JSON.stringify(h.im.debugExport())).not.toContain(SECRET_NAME);
   });
 
+  it('两个会话都要重拉、AB 失败：G1 照拉并记新 modVer；下次重连只重拉 AB（P-39 ②）', async () => {
+    const { h, c1 } = await loaded();
+    c1.drop(1006);
+    h.clock.advance(1_000);
+    await flush();
+    const c2 = await h.login(USER, [
+      conv({ convId: AB, maxSeq: 2, modVer: 4 }),
+      conv({ convId: G1, maxSeq: 1, modVer: 8 }),
+    ]);
+    expect(c2.last('sync').data).toMatchObject({ convId: AB });
+    c2.ackError('sync', 5000);
+    await flush();
+    // AB 失败不中断：接着对 G1 发 sync
+    expect(c2.last('sync').data).toMatchObject({ convId: G1 });
+    c2.ack('sync', { messages: [img(G1, 1, 'G1F', true)], hasMore: false });
+    await flush();
+    expect(h.im.messages(G1)[0]!.body.image!.expired).toBe(true);
+    expect(h.im.messages(AB)[0]!.body.image!.expired).toBeUndefined();
+    expect(
+      c2
+        .frames()
+        .filter((f) => f.cmd === 'sync')
+        .map((f) => f.data!['convId']),
+    ).toEqual([AB, G1]);
+    c2.drop(1006);
+    h.clock.advance(1_000);
+    await flush();
+    const c3 = await h.login(USER, [
+      conv({ convId: AB, maxSeq: 2, modVer: 4 }),
+      conv({ convId: G1, maxSeq: 1, modVer: 8 }),
+    ]);
+    c3.ack('sync', { messages: [img(AB, 1, 'F1', true), fileMsg(AB, 2, 'F2', true)], hasMore: false });
+    await flush();
+    expect(
+      c3
+        .frames()
+        .filter((f) => f.cmd === 'sync')
+        .map((f) => f.data!['convId']),
+    ).toEqual([AB]);
+    expect(h.im.messages(AB)[0]!.body.image!.expired).toBe(true);
+  });
+
   it('老服务端（convs 没有 modVer）：仍然全部重拉', async () => {
     const { h, c1 } = await loaded();
     c1.drop(1006);
