@@ -49,12 +49,21 @@ export class IMError extends Error {
   readonly userId?: string;
   /** error.details 原样透传，例如 4031 的 {scope, groupId?, mutedUntil}。 */
   readonly details?: Readonly<Record<string, unknown>>;
-  constructor(code: number, message: string, userId?: string, details?: Readonly<Record<string, unknown>>) {
+  /** error.reason：细分同一个错误码（4040 的 quoteUnavailable、4030 的 mentionAllForbidden 等，errors.json 的 reasons）。 */
+  readonly reason?: string;
+  constructor(
+    code: number,
+    message: string,
+    userId?: string,
+    details?: Readonly<Record<string, unknown>>,
+    reason?: string,
+  ) {
     super(`${code} ${message}`);
     this.name = 'IMError';
     this.code = code;
     this.userId = userId;
     this.details = details;
+    if (reason !== undefined) this.reason = reason;
   }
   get description(): ErrorDescription {
     return describeError(this.code);
@@ -69,10 +78,18 @@ export class IMError extends Error {
 export function messageFor(
   cmd: string,
   code: number,
-  ctx: { strangerMsgLimit?: number; name?: string } = {},
+  ctx: { strangerMsgLimit?: number; name?: string; windowSeconds?: number } = {},
 ): string | undefined {
+  // 4097 按 details.windowSeconds 选时限（PRD-chat 第 11.5 节）：120 秒"2 分钟"，604800 秒"7 天"。
+  if (cmd === 'recall' && code === 4097) return `发送时间超过 ${windowText(ctx.windowSeconds ?? 120)}，无法撤回`;
   const t = COPY[`${cmd}:${code}`] ?? COPY[`*:${code}`];
   return t?.replace('{N}', String(ctx.strangerMsgLimit ?? 0)).replace('{name}', ctx.name ?? '');
+}
+
+function windowText(sec: number): string {
+  if (sec >= 86_400 && sec % 86_400 === 0) return `${sec / 86_400} 天`;
+  if (sec >= 60 && sec % 60 === 0) return `${sec / 60} 分钟`;
+  return `${sec} 秒`;
 }
 
 const DAILY = '今天的次数已用完，明天再试';
@@ -83,6 +100,8 @@ const COPY: Readonly<Record<string, string>> = {
   'send:4036': '消息已发出，但被对方拒收了',
   'send:4137': '对方回复之前，最多只能发送 {N} 条消息',
   'send:4292': '今天发起新聊天的次数已用完，请稍后再试',
+  'send:4293': '@所有人次数已用完',
+  'recall:4030': '你没有权限撤回这条消息',
   'friendApply:4132': '你的好友数量已达上限',
   'friendRespond:4132': '你的好友数量已达上限',
   'friendRespond:4133': '对方好友数量已达上限',

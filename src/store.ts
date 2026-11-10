@@ -1,4 +1,13 @@
-import type { ConvType, GroupRole, LastMsg, MsgBody, MsgType, ServerConversation, ServerMessage } from './protocol.js';
+import type {
+  ConvType,
+  GroupRole,
+  LastMsg,
+  MsgBody,
+  MsgType,
+  QuoteView,
+  ServerConversation,
+  ServerMessage,
+} from './protocol.js';
 import { countCodePoints } from './text.js';
 
 /**
@@ -32,9 +41,14 @@ export interface Message {
   error?: MessageError;
   /** 错误码的 reason（例如 4290 的 uploadPendingLimit）。 */
   errorReason?: string;
-  /** 被删除（PRD-admin F-ADM-31）：seq、msgId、发送者、时间都保留，body 为空对象。 */
+  /** 被删除（PRD-admin F-ADM-31）或撤回：seq、msgId、发送者、时间都保留，body 为空对象。 */
   deleted?: boolean;
   deletedAt?: number;
+  /** 被撤回（PRD-chat F-RCL-01 规则 5a）：同时 deleted=true。文案用 recallNotice / recallText。 */
+  recalled?: boolean;
+  recalledAt?: number;
+  /** 撤回的操作者；老服务端或本地推断不出来时为空。 */
+  recalledBy?: string;
 }
 
 /** 界面看到的一个会话。 */
@@ -54,6 +68,10 @@ export interface Conversation {
   myRole?: GroupRole;
   /** 已有消息展示内容的版本号（F-RCL-03 规则 2）；老服务端没有。 */
   modVer?: number;
+  /** 未读中提及我的数量（F-MEN-03 规则 1）：大于 0 时列表摘要前缀"[有人@我]"。服务端没给时为 undefined。 */
+  mentionUnread?: number;
+  /** 未读里第一条提及我的 seq（"有人@我"跳转按钮）。 */
+  firstMentionSeq?: number;
 }
 
 /**
@@ -75,9 +93,36 @@ interface ConvState extends Conversation {
 
 const SUMMARY_LEN = 100;
 
-/** 被删除的最后一条消息的摘要：不保留原文。 */
-function deletedLast(m: { msgId: string; from: string; type: string; ts: number }): LastMsg {
-  return { msgId: m.msgId, from: m.from, type: m.type, ts: m.ts, deleted: true };
+/** 撤回的信息（msgDeleted 的 recalled，或 sync 下发的 recalled、recalledBy、recalledAt）。by 为空表示不知道是谁。 */
+export interface RecallInfo {
+  by: string;
+  at?: number;
+}
+
+/** 被删除的最后一条消息的摘要：不保留原文。撤回时带 recalled、recalledBy（F-RCL-03 规则 4）。 */
+function deletedLast(m: { msgId: string; from: string; type: string; ts: number }, recall?: RecallInfo): LastMsg {
+  const out: LastMsg = { msgId: m.msgId, from: m.from, type: m.type, ts: m.ts, deleted: true };
+  if (recall) {
+    out.recalled = true;
+    if (recall.by) out.recalledBy = recall.by;
+  }
+  return out;
+}
+
+function recallOf(m: { recalled?: boolean; recalledBy?: string; recalledAt?: number }): RecallInfo | undefined {
+  if (m.recalled !== true) return undefined;
+  const r: RecallInfo = { by: m.recalledBy ?? '' };
+  if (m.recalledAt !== undefined) r.at = m.recalledAt;
+  return r;
+}
+
+/** 引用清除原文（F-QUO-02 规则 4）：只留定位用的 msgId、seq、from、type 和新状态。 */
+function clearedQuote(q: QuoteView, state: string): QuoteView {
+  const out: QuoteView = { msgId: q.msgId, state };
+  if (q.seq !== undefined) out.seq = q.seq;
+  if (q.from !== undefined) out.from = q.from;
+  if (q.type !== undefined) out.type = q.type;
+  return out;
 }
 
 /** 图片或文件已过期（F-FILE-06 规则 3）。 */
@@ -97,15 +142,44 @@ function summary(text: string): string {
   return Array.from(text).slice(0, SUMMARY_LEN).join('');
 }
 
+/** 删除或撤回后的消息：只留定位和展示需要的字段，正文、文件名、引用都清掉（F-RCL-03 规则 3）。 */
+function deletedMessage(
+  m: Pick<Message, 'clientMsgId' | 'convId' | 'from' | 'type' | 'ts'> & { msgId?: string; seq?: number },
+  deletedAt?: number,
+  recall?: RecallInfo,
+): Message {
+  const out: Message = {
+    clientMsgId: m.clientMsgId,
+    convId: m.convId,
+    from: m.from,
+    type: m.type,
+    body: {},
+    ts: m.ts,
+    status: 'sent',
+    deleted: true,
+  };
+  if (m.msgId !== undefined) out.msgId = m.msgId;
+  if (m.seq !== undefined) out.seq = m.seq;
+  if (deletedAt !== undefined) out.deletedAt = deletedAt;
+  return recall ? withRecall(out, recall) : out;
+}
+
+function withRecall(m: Message, recall: RecallInfo): Message {
+  const out: Message = { ...m, recalled: true };
+  if (recall.by) out.recalledBy = recall.by;
+  if (recall.at !== undefined) out.recalledAt = recall.at;
+  return out;
+}
+
 /** 一个会话的消息：有 seq 的按 seq 升序，没有 seq 的（待发 / 失败）按发送顺序排在最后（F-MSG-03 规则 3）。 */
 class MessageList {
   private bySeq = new Map<number, Message>();
   private unsent: Message[] = [];
   private byClient = new Map<string, Message>();
   private byMsgId = new Set<string>();
-  // 已知被删除的 msgId / seq：之后才到的 sync 结果、发送 ack 带着原文也不能写回来。
-  private deletedIds = new Set<string>();
-  private deletedSeqs = new Set<number>();
+  // 已知被删除的 msgId / seq：之后才到的 sync 结果、发送 ack 带着原文也不能写回来。值是撤回信息（后台删除为 undefined）。
+  private deletedIds = new Map<string, RecallInfo | undefined>();
+  private deletedSeqs = new Map<number, RecallInfo | undefined>();
   // 已知文件已过期的 msgId（F-FILE-06 规则 3）：expired 只能从假变真，迟到的旧 sync 不能把它改回去（F-RCL-03 规则 2a）。
   private expiredIds = new Set<string>();
   /** 这次合并里刚变成过期的 fileId，由 Store 取走（清缓存用）。 */
@@ -120,21 +194,33 @@ class MessageList {
 
   /**
    * 合并服务端消息；按 msgId 去重，按 clientMsgId 合并本地待发消息。
-   * 已有的消息单调合并（F-RCL-03 规则 2a）：deleted、文件的 expired 只能从假变真，deletedIds 优先；
-   * 迟到的旧 sync 应答带着原文或 expired=false 时不回写。返回合并后的消息，没有变化时为 null。
+   * 已有的消息单调合并（F-RCL-03 规则 2a）：deleted、recalled、文件的 expired 只能从假变真，deletedIds 优先；
+   * quote.state 只能从 normal 往后走，quote.text 清除后不恢复；迟到的旧 sync 应答带着原文、expired=false、
+   * deleted=false 或 quote.state=normal 时不回写。返回合并后的消息，没有变化时为 null。
    */
   addServer(m: ServerMessage): Message | null {
     if (this.removedClient.get(m.clientMsgId) === m.from) return null;
     const deleted = m.deleted === true || this.isDeleted(m.msgId, m.seq);
+    const recall = recallOf(m) ?? this.recallOf(m.msgId, m.seq);
     if (this.byMsgId.has(m.msgId)) {
       const old = this.bySeq.get(m.seq);
-      if (!old || old.deleted) return null;
-      if (deleted) return this.wipe(old, m.deletedAt);
+      if (!old) return null;
+      if (old.deleted) {
+        // 已删除的只接受"后台删除 → 撤回"的补充信息（recalled 从假变真），正文不会回来。
+        if (!recall || old.recalled) return null;
+        return this.replace(old, withRecall(old, recall));
+      }
+      if (deleted) return this.wipe(old, m.deletedAt, recall);
+      let body = old.body;
       if (fileExpired(m.body) && !fileExpired(old.body)) {
         this.expiredIds.add(m.msgId);
-        return this.replace(old, { ...old, body: expireBody(old.body) });
+        body = expireBody(body);
       }
-      return null;
+      const q = old.body.quote;
+      const nq = m.body?.quote;
+      if (q && q.state === 'normal' && nq && nq.state !== 'normal')
+        body = { ...body, quote: clearedQuote(q, nq.state) };
+      return body === old.body ? null : this.replace(old, { ...old, body });
     }
     const local = this.byClient.get(m.clientMsgId);
     if (local && local.seq === undefined && local.from === m.from) {
@@ -146,7 +232,10 @@ class MessageList {
       this.expiredIds.add(m.msgId);
       body = expireBody(body);
     }
-    const msg: Message = deleted ? { ...m, body: {}, deleted: true, status: 'sent' } : { ...m, body, status: 'sent' };
+    // 引用的消息本地已知被撤回或删除：这份应答可能是撤回之前生成的，引用原文不能写进来（AC-RCL-03-13）。
+    const gone = body.quote?.state === 'normal' ? this.goneState(body.quote.msgId, body.quote.seq) : undefined;
+    if (gone && body.quote) body = { ...body, quote: clearedQuote(body.quote, gone) };
+    const msg: Message = deleted ? deletedMessage(m, m.deletedAt, recall) : { ...m, body, status: 'sent' };
     this.bySeq.set(m.seq, msg);
     this.byClient.set(m.clientMsgId, msg);
     this.byMsgId.add(m.msgId);
@@ -158,25 +247,60 @@ class MessageList {
     return this.deletedIds.has(msgId) || (seq !== undefined && this.deletedSeqs.has(seq));
   }
 
-  /** 记下被删除的消息并清掉已加载的原文。返回是否有消息变了。 */
-  markDeleted(msgIds: readonly string[], seqs: readonly number[]): boolean {
-    for (const id of msgIds) this.deletedIds.add(id);
-    for (const s of seqs) this.deletedSeqs.add(s);
+  /** 本地已知的撤回信息（只有撤回的有，后台删除的没有）。 */
+  recallOf(msgId: string, seq?: number): RecallInfo | undefined {
+    return this.deletedIds.get(msgId) ?? (seq !== undefined ? this.deletedSeqs.get(seq) : undefined);
+  }
+
+  /** 引用这条消息的 quote 应有的状态：已知撤回为 recalled，已知删除为 deleted，其他为 undefined。 */
+  private goneState(msgId: string, seq?: number): 'recalled' | 'deleted' | undefined {
+    if (!this.isDeleted(msgId, seq)) return undefined;
+    return this.recallOf(msgId, seq) ? 'recalled' : 'deleted';
+  }
+
+  /**
+   * 记下被删除（recall 不为空时是撤回）的消息并清掉已加载的原文；本会话里引用这几条的消息（含待发的）清除引用原文，
+   * 状态改成 recalled 或 deleted（F-QUO-02 规则 4）。撤回信息只增不减：已经知道是撤回的，之后的后台删除不改回去。
+   * 返回是否有消息变了。
+   */
+  markDeleted(msgIds: readonly string[], seqs: readonly number[], recall?: RecallInfo): boolean {
+    for (const id of msgIds) this.deletedIds.set(id, recall ?? this.deletedIds.get(id));
+    for (const s of seqs) this.deletedSeqs.set(s, recall ?? this.deletedSeqs.get(s));
     let changed = false;
     for (const m of [...this.bySeq.values()]) {
-      if (!m.deleted && this.isDeleted(m.msgId ?? '', m.seq)) {
-        this.wipe(m);
+      if (!this.isDeleted(m.msgId ?? '', m.seq)) continue;
+      const r = this.recallOf(m.msgId ?? '', m.seq);
+      if (!m.deleted) {
+        this.wipe(m, undefined, r);
+        changed = true;
+      } else if (r && !m.recalled) {
+        this.replace(m, withRecall(m, r));
         changed = true;
       }
+    }
+    for (const m of [...this.bySeq.values(), ...this.unsent]) {
+      const q = m.body.quote;
+      if (!q || q.state !== 'normal') continue;
+      const gone = this.goneState(q.msgId, q.seq);
+      if (!gone) continue;
+      const body = { ...m.body, quote: clearedQuote(q, gone) };
+      if (m.seq !== undefined) this.replace(m, { ...m, body });
+      else this.update(m.clientMsgId, { body });
+      changed = true;
     }
     return changed;
   }
 
-  private wipe(old: Message, deletedAt?: number): Message {
-    const next: Message = { ...old, body: {}, deleted: true };
-    if (deletedAt !== undefined) next.deletedAt = deletedAt;
+  /** 按 msgId 找已加载的消息（引用、撤回用）。 */
+  findByMsgId(msgId: string): Message | undefined {
+    if (!this.byMsgId.has(msgId)) return undefined;
+    for (const m of this.bySeq.values()) if (m.msgId === msgId) return m;
+    return undefined;
+  }
+
+  private wipe(old: Message, deletedAt?: number, recall?: RecallInfo): Message {
     this.noteExpired(old.body); // 文件的缓存同样要清（F-RCL-03 规则 3）
-    return this.replace(old, next);
+    return this.replace(old, deletedMessage(old, deletedAt ?? old.deletedAt, recall));
   }
 
   private replace(old: Message, next: Message): Message {
@@ -369,9 +493,14 @@ export class Store {
   private fromServer(c: ServerConversation): ConvState {
     const { mutedUntil: _, allMuted: __, ...rest } = c; // 禁言状态由 IMClient 的 MuteTable 维护，事件和到期都会改它
     const last = c.lastMsg;
-    // 这份 convs 可能是删除之前生成的：已知被删除的消息不能把原文带回摘要。
-    const stale = last && !last.deleted && this.msgs.get(c.convId)?.isDeleted(last.msgId);
-    return { ...rest, lastMsg: stale ? deletedLast(last) : last, readBase: c.maxSeq - c.unread };
+    // 这份 convs 可能是删除之前生成的：已知被删除的消息不能把原文带回摘要；已知是撤回的，摘要也保持撤回（只能从假变真）。
+    const list = this.msgs.get(c.convId);
+    let lastMsg = last;
+    if (last && list?.isDeleted(last.msgId) && (!last.deleted || !last.recalled)) {
+      const recall = list.recallOf(last.msgId);
+      if (!last.deleted || recall) lastMsg = deletedLast(last, recall);
+    }
+    return { ...rest, lastMsg, readBase: c.maxSeq - c.unread };
   }
 
   /** 已读位置前进（自己上报、其他端同步、发言即已读），只进不退。 */
@@ -380,6 +509,24 @@ export class Store {
     if (!c || seq <= c.readSeq) return false;
     c.readSeq = seq;
     this.recount(c);
+    return true;
+  }
+
+  /** 本端已读到最新：提及我的未读也清零（F-MEN-03 规则 1"已读前进后减少"），跳转按钮消失。 */
+  clearMentions(convId: string): boolean {
+    const c = this.convs.get(convId);
+    if (!c?.mentionUnread || c.readSeq < c.maxSeq) return false;
+    c.mentionUnread = 0;
+    delete c.firstMentionSeq;
+    return true;
+  }
+
+  /** 实时收到一条提及我的未读消息：本地先加 1，下次 convs 时以服务端为准（AC-MEN-01-1）。服务端没给过计数的会话不推算。 */
+  bumpMention(convId: string, seq: number): boolean {
+    const c = this.convs.get(convId);
+    if (!c || c.mentionUnread === undefined || seq <= c.readSeq) return false;
+    c.mentionUnread += 1;
+    if (!c.firstMentionSeq || seq < c.firstMentionSeq) c.firstMentionSeq = seq;
     return true;
   }
 
@@ -420,14 +567,19 @@ export class Store {
     this.bumpMax(m.convId, m.seq);
     if (!merged) return false;
     const c = this.convs.get(m.convId) ?? this.newConversation(m);
+    const recall = merged.recalled ? { by: merged.recalledBy ?? '' } : undefined;
     if (m.seq > c.maxSeq) {
       c.maxSeq = m.seq;
       c.lastMsg = merged.deleted
-        ? deletedLast(m)
+        ? deletedLast(m, recall)
         : { msgId: m.msgId, from: m.from, type: m.type, text: summary(merged.body.text ?? ''), ts: m.ts };
       c.updatedAt = Math.max(c.updatedAt, m.ts);
-    } else if (merged.deleted && c.lastMsg?.msgId === m.msgId) {
-      c.lastMsg = deletedLast(c.lastMsg);
+    } else if (
+      merged.deleted &&
+      c.lastMsg?.msgId === m.msgId &&
+      (!c.lastMsg.deleted || (recall && !c.lastMsg.recalled))
+    ) {
+      c.lastMsg = deletedLast(c.lastMsg, recall);
     }
     if (m.from === this.self()) c.readSeq = Math.max(c.readSeq, m.seq);
     this.recount(c);
@@ -435,14 +587,16 @@ export class Store {
   }
 
   /**
-   * 消息被删除（msgDeleted，或 convs 的 lastMsg.deleted）：清除原文，摘要改成占位。seq 不留空洞，未读不变（C-02）。
+   * 消息被删除或撤回（msgDeleted，或 convs 的 lastMsg.deleted）：清除原文和引用它的原文，摘要改成占位。
+   * seq 不留空洞，未读不变、updatedAt 不变（C-02，F-RCL-01 规则 6）。recall 不为空表示撤回。
    * 没加载过的消息也记下来，之后到的 sync 结果、发送 ack 不会把原文写回来。返回消息列表是否有变化。
    */
-  deleteMessages(convId: string, msgIds: readonly string[], seqs: readonly number[]): boolean {
-    const changed = this.list(convId).markDeleted(msgIds, seqs);
+  deleteMessages(convId: string, msgIds: readonly string[], seqs: readonly number[], recall?: RecallInfo): boolean {
+    const changed = this.list(convId).markDeleted(msgIds, seqs, recall);
     const c = this.convs.get(convId);
-    if (c?.lastMsg && !c.lastMsg.deleted && (msgIds.includes(c.lastMsg.msgId) || seqs.includes(c.maxSeq))) {
-      c.lastMsg = deletedLast(c.lastMsg);
+    const last = c?.lastMsg;
+    if (c && last && (msgIds.includes(last.msgId) || seqs.includes(c.maxSeq))) {
+      if (!last.deleted || (recall && !last.recalled)) c.lastMsg = deletedLast(last, recall);
     }
     return changed;
   }
@@ -534,7 +688,9 @@ function sameLast(a: LastMsg | null, b: LastMsg | null): boolean {
     a.text === b.text &&
     a.from === b.from &&
     a.type === b.type &&
-    a.deleted === b.deleted
+    a.deleted === b.deleted &&
+    a.recalled === b.recalled &&
+    a.recalledBy === b.recalledBy
   );
 }
 
@@ -550,6 +706,8 @@ function sameConversation(a: Conversation, b: Conversation): boolean {
     a.updatedAt === b.updatedAt &&
     a.memberCount === b.memberCount &&
     a.myRole === b.myRole &&
+    a.mentionUnread === b.mentionUnread &&
+    a.firstMentionSeq === b.firstMentionSeq &&
     sameLast(a.lastMsg, b.lastMsg)
   );
 }

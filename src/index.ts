@@ -1,7 +1,11 @@
 // IM 统一 SDK（TypeScript）。对外接口见 docs/sdk/README.md。
 export {
+  GROUP_RECALL_WINDOW_MS,
   IMClient,
+  RECALL_WINDOW_MS,
   type AttachmentOptions,
+  type MessageAction,
+  type SendOptions,
   type ApplyFriendOptions,
   type IMClientOptions,
   type IMClientTimings,
@@ -54,7 +58,8 @@ export {
 } from './social.js';
 export type { ConnState, FatalReason } from './connection.js';
 export { ConnectionClosedError, NotConnectedError, TimeoutError } from './connection.js';
-export type { Conversation, ConversationSnapshot, Message, MessageError, MessageStatus } from './store.js';
+export type { Conversation, ConversationSnapshot, Message, MessageError, MessageStatus, RecallInfo } from './store.js';
+export { quoteLabel, quoteSummary, recallNoticeOf, recallText, type RecallNotice } from './recall.js';
 export { fileExpired } from './store.js';
 export {
   COMPLETE_RETRIES,
@@ -105,7 +110,10 @@ export {
   type FileBody,
   type GroupRole,
   type ImageBody,
+  type Mentions,
   type MsgBody,
+  type QuoteState,
+  type QuoteView,
   type MsgType,
   type TipBody,
   type Platform,

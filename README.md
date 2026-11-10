@@ -115,6 +115,25 @@ im.on('filesExpired', (fileIds) => …);         // 过期或被删：清掉 App
 源（File / Blob）只在内存里，发出后释放，刷新就没有了。预签名地址和文件名不进日志。
 重连时只重拉 `modVer` 变了的会话（服务端没有 `modVer` 时全部重拉）；`deleted`、`expired` 只能从假变真。
 
+## 撤回、引用、提及（PRD-chat C4）
+
+```ts
+await im.recall(convId, msgId);                 // 成功后本地立即变撤回；失败抛 IMError，不自动重试
+im.canRecall(message);                          // 按 ts 和 auth ack 校正后的服务端时间：自己的 2 分钟；群主、管理员 7 天
+im.messageActions(message);                     // ['copy', 'quote', 'recall'] 的子集；撤回、删除的消息和提示行是 []
+im.recallText(convId, messageOrLastMsg);        // F-RCL-02 规则 1a 的文案（聊天页和列表摘要同一张表）；不是撤回的为 null
+im.send(convId, text, { quote: { msgId }, mentions: { userIds, all } }); // mentions 只在群聊（单聊直接抛错）
+await im.searchGroupMembers(groupId, keyword);  // @ 选人：userId 或昵称前缀
+quoteLabel(message.body.quote);                 // "引用内容已被撤回"等四种状态的文字，页面按纯文本渲染
+messageFor('recall', 4097, { windowSeconds });  // "发送时间超过 2 分钟，无法撤回"；4030 "你没有权限撤回这条消息"；send 4293 "@所有人次数已用完"
+```
+
+撤回复用 `msgDeleted`：消息和 `lastMsg` 同时 `deleted`、`recalled`，带 `recalledBy`；原文、文件名、本地所有引用它的 `quote.text` 都清掉，文件通过 `filesExpired` 通知。
+`deleted`、`recalled` 只能从假变真，`quote.state` 只能从 `normal` 往后走，迟到的旧应答不回写。
+`Conversation.mentionUnread`、`firstMentionSeq` 来自 `convs`；实时收到 @ 我的消息本地加 1，在这个会话读到最新后清零；
+有提及时收到 `readUpdated`、`msgDeleted` 重新拉 `convs`，5 秒内最多一次。4040（`errorReason: 'quoteUnavailable'`）、4293、4131 标记失败，不自动重发。
+引用文字、@ 的内容不进日志。
+
 ## 删除失败的消息（PRD-ui G-UI-14）
 
 ```ts

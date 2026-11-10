@@ -322,7 +322,13 @@ export class Connection extends Emitter<ConnEvents> {
     this.pending.delete(f.id);
     this.o.clock.clearTimeout(p.timer);
     const err = f.error
-      ? new IMError(f.error.code, f.error.msg, f.error.userId ?? f.error.details?.userId, f.error.details)
+      ? new IMError(
+          f.error.code,
+          f.error.msg,
+          f.error.userId ?? f.error.details?.userId,
+          f.error.details,
+          f.error.reason,
+        )
       : undefined;
     if (p.timedOut) {
       p.onLateAck?.(f.data, err);

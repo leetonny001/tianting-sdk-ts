@@ -2,7 +2,7 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { SchemaValidator } from './support/json-schema.js';
-import { setup, flush } from './helpers.js';
+import { conv, flush, msg, setup } from './helpers.js';
 
 const read = (p: string) => JSON.parse(readFileSync(new URL(`../protocol/${p}`, import.meta.url), 'utf8'));
 const frames = read('vectors/frames.json') as {
@@ -12,13 +12,15 @@ const frames = read('vectors/frames.json') as {
 const validator = new SchemaValidator(read('schema/frame.schema.json'));
 
 describe('TC-CHAT-90-09 frames.json 按 frame.schema.json 校验', () => {
+  // C4 的新帧（recall、quote、mentions、msgDeleted.recalled、mentionUnread、groupMembers 的 keyword）是 TC-CHAT-90-32。
+  const tc = (name: string) => (name.includes('（C4') ? 'TC-CHAT-90-32 ' : '');
   for (const v of frames.valid) {
-    it(`合法：${v.name}`, () => {
+    it(`${tc(v.name)}合法：${v.name}`, () => {
       expect(validator.errors(v.frame)).toEqual([]);
     });
   }
   for (const v of frames.invalid) {
-    it(`非法：${v.name}`, () => {
+    it(`${tc(v.name)}非法：${v.name}`, () => {
       expect(validator.errors(v.frame)).not.toEqual([]);
     });
   }
@@ -55,5 +57,26 @@ describe('TC-CHAT-90-09 frames.json 按 frame.schema.json 校验', () => {
     await flush();
     expect(c.frames().length).toBeGreaterThanOrEqual(3);
     for (const f of c.frames()) expect(validator.errors(f), f.cmd).toEqual([]);
+  });
+
+  it('TC-CHAT-90-32 SDK 发出的 C4 帧符合 Schema：recall、send 带 quote 和 mentions、groupMembers 带 keyword', async () => {
+    const h = setup();
+    h.im.connect('token-value');
+    const g = 'group:g1';
+    const c = await h.login('alice', [conv({ convId: g, maxSeq: 3, myRole: 'owner' })]);
+    void h.im.loadHistory(g);
+    await flush();
+    c.ack('sync', { messages: [{ ...msg(g, 3, 'bob', '被引用的原文'), msgId: 'm3' }], hasMore: false });
+    await flush();
+    h.im.send(g, '@bob 看这条', { quote: { msgId: 'm3' }, mentions: { userIds: ['bob', 'bob'] } });
+    h.im.send(g, '@所有人 开会', { mentions: { all: true } });
+    h.im.send('c2c:alice:bob', '单聊引用', { quote: { msgId: 'm1' } });
+    void h.im.recall(g, 'm3').catch(() => undefined);
+    void h.im.searchGroupMembers('g1', 'zh').catch(() => undefined);
+    await flush();
+    const cmds = c.frames().map((f) => f.cmd);
+    expect(cmds).toEqual(expect.arrayContaining(['recall', 'send', 'groupMembers']));
+    for (const f of c.frames()) expect(validator.errors(f), f.cmd).toEqual([]);
+    expect(c.last('groupMembers').data).toEqual({ groupId: 'g1', keyword: 'zh' });
   });
 });

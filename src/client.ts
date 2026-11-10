@@ -30,8 +30,12 @@ import {
   parseConvIdStrict,
   type AuthAck,
   type ConvsAck,
+  type GroupRole,
   type InboundFrame,
+  type LastMsg,
+  type Mentions,
   type Platform,
+  type QuoteView,
   type SendAck,
   type ServerConversation,
   type ServerEvent,
@@ -57,7 +61,15 @@ import {
   type SocialSyncAck,
   type UserProfile,
 } from './social.js';
-import { Store, type Conversation, type ConversationSnapshot, type Message, type MessageError } from './store.js';
+import { quoteSummary, recallNoticeOf, recallText, type RecallNotice } from './recall.js';
+import {
+  Store,
+  type Conversation,
+  type ConversationSnapshot,
+  type Message,
+  type MessageError,
+  type RecallInfo,
+} from './store.js';
 import { checkText, type TextCheck } from './text.js';
 import type { SessionEnd, TokenProvider } from './token-provider.js';
 import { WebSocketTransport, type Transport } from './transport.js';
@@ -142,6 +154,11 @@ const MAX_CATCH_UP = 200;
 const PAGE = 200;
 const LATEST_PAGE = 20;
 const REFRESH_THROTTLE_MS = 30_000; // refreshConversations 的节流（G-UI-24）
+/** 提及计数的刷新节流（F-MEN-03 规则 1，未校准）：5 秒内最多拉一次 convs，窗口内的事件在窗口结束时补拉一次。 */
+const MENTION_REFRESH_MS = 5_000;
+/** 撤回时限（PRD-chat F-RCL-01 规则 1、F-RCL-02 规则 2 的默认值）。服务端可以配置，不一致时以服务端的 4097 为准。 */
+export const RECALL_WINDOW_MS = 120_000;
+export const GROUP_RECALL_WINDOW_MS = 7 * 86_400_000;
 // 禁言最长 30 天，超过 setTimeout 的上限（约 24.8 天，超出会立即触发）：分段等，到点再算一次。
 const MUTE_TIMER_MAX_MS = 86_400_000;
 
@@ -233,6 +250,20 @@ const SOCIAL_PAGE = 500;
 const USERS_BATCH = 100;
 
 export type SendResult = { ok: true; message: Message } | Exclude<TextCheck, { ok: true }>;
+
+/** send 的第三个参数（PRD-chat 第 13.1 节，R-CF-26）。 */
+export interface SendOptions {
+  /** 引用一条已发送的消息（F-QUO-01）：上行只发 msgId；本地待发的消息用已加载的原消息先拼出引用条。 */
+  quote?: { msgId: string };
+  /**
+   * @（F-MEN-01、02）：只在群聊。userIds 去重；全空且没有 all 时不带。人数上限由服务端判断（4131）。
+   * 正文里的 "@昵称 " 由 App 插入（用资料昵称，不用备注，R-CF-03），服务端不解析正文。
+   */
+  mentions?: Mentions;
+}
+
+/** 消息菜单里 SDK 判断的几项（F-UI-09 扩展，PRD-chat 第 13.3 节）。举报随 C6；失败消息的重发、删除由页面按 status 判断。 */
+export type MessageAction = 'copy' | 'quote' | 'recall';
 
 /**
  * IM 统一 SDK 的入口（PLAN 3.2 的 IMClient）。不依赖任何 UI 框架：界面订阅事件、读取快照即可。
@@ -409,19 +440,27 @@ export class IMClient extends Emitter<ClientEvents> {
 
   /**
    * 发送文本。先在本地插入一条"发送中"（离线时"排队"）的消息，ack 后更新为已发送。
-   * 文本为空或超过 5000 字时不发送，返回原因。
+   * 文本为空或超过 5000 字时不发送，返回原因。opts 可以带引用和 @（C4）：单聊带 mentions 直接抛错（服务端也会 4000）。
+   * 4040（reason=quoteUnavailable）、4293（@ 所有人次数用完）、4131 和其他错误码一样标记失败，不自动重发。
    */
-  send(convId: string, raw: string): SendResult {
+  send(convId: string, raw: string, opts: SendOptions = {}): SendResult {
     const check = checkText(raw);
     if (!check.ok) return check;
     if (!this.self) throw new NotConnectedError(); // 需要先连接成功一次，才知道自己是谁
-    parseConvIdStrict(convId, this.self); // 格式错误在入队前抛错：不留下永远"发送中"的消息
+    const { convType } = parseConvIdStrict(convId, this.self); // 格式错误在入队前抛错：不留下永远"发送中"的消息
+    const body: Message['body'] = { text: check.text };
+    if (opts.quote) body.quote = this.localQuote(convId, opts.quote.msgId);
+    const mentions = normalizeMentions(opts.mentions);
+    if (mentions) {
+      if (convType !== 'group') throw new TypeError('mentions are only allowed in group conversations');
+      body.mentions = mentions;
+    }
     const msg: Message = {
       clientMsgId: this.newId(),
       convId,
       from: this.self,
       type: 'text',
-      body: { text: check.text },
+      body,
       ts: this.clock.now(),
       status: this.conn.state === 'connected' ? 'sending' : 'queued',
     };
@@ -429,6 +468,80 @@ export class IMClient extends Emitter<ClientEvents> {
     this.emitMessages(convId);
     if (msg.status === 'sending') this.dispatch(convId, msg.clientMsgId);
     return { ok: true, message: msg };
+  }
+
+  /** 本地待发消息里的引用条：被引用的消息已加载时按服务端同样的规则拼摘要（F-QUO-02 规则 2），否则只有 msgId。 */
+  private localQuote(convId: string, msgId: string): QuoteView {
+    const list = this.store.list(convId);
+    const m = list.findByMsgId(msgId);
+    if (!m) return { msgId, state: 'normal' };
+    const q: QuoteView = { msgId, seq: m.seq, from: m.from, type: m.type, state: 'normal' };
+    if (m.deleted) q.state = m.recalled ? 'recalled' : 'deleted';
+    else q.text = quoteSummary(m);
+    return q;
+  }
+
+  /**
+   * 撤回（PRD-chat F-RCL-01、02，第 13.1 节）。成功后本地立即按撤回处理：清除原文、引用它的原文、文件缓存
+   * （服务端不给发起撤回的这条连接发 msgDeleted，只回 ack）。失败抛 IMError，不自动重试：
+   * 4097 带 details.windowSeconds（messageFor('recall', 4097, {windowSeconds}) 给文案）；
+   * 4030 是没有权限（"你没有权限撤回这条消息"，管理员撤回其他管理员，AC-RCL-02-5）；4044 消息不存在或已被后台删除。
+   * 重复撤回是幂等成功。
+   */
+  async recall(convId: string, msgId: string): Promise<void> {
+    if (!this.self) throw new NotConnectedError();
+    await this.conn.request('recall', { convId, msgId });
+    const seq = this.store.list(convId).findByMsgId(msgId)?.seq;
+    this.applyDeleted(convId, [msgId], seq !== undefined ? [seq] : [], { by: this.self, at: this.serverNow() });
+  }
+
+  /**
+   * 这条消息现在能不能撤回（菜单里显示"撤回"，AC-RCL-01-8）：按消息 ts 和 auth ack 校正后的服务端时间判断，不用设备时钟。
+   * 自己的消息 2 分钟内；群主、管理员撤回自己的取更宽的 7 天；群主 7 天内任何人的；管理员 7 天内别人的
+   * （对方是管理员或群主时服务端回 4030，客户端不知道对方角色，F-RCL-02 规则 1b）。
+   * 只有已发送的 text、image、file；撤回、删除的消息和提示行不能。myRole 不传时用会话列表里的角色。
+   */
+  canRecall(m: Message, myRole?: GroupRole): boolean {
+    if (m.status !== 'sent' || !m.msgId || m.deleted) return false;
+    if (m.type !== 'text' && m.type !== 'image' && m.type !== 'file') return false;
+    const group = m.convId.startsWith('group:');
+    const role = group ? (myRole ?? this.store.conversation(m.convId)?.myRole) : undefined;
+    const manager = role === 'owner' || role === 'admin';
+    let window: number;
+    if (m.from === this.self) window = manager ? Math.max(RECALL_WINDOW_MS, GROUP_RECALL_WINDOW_MS) : RECALL_WINDOW_MS;
+    else if (group && manager) window = GROUP_RECALL_WINDOW_MS;
+    else return false;
+    return this.serverNow() - m.ts <= window;
+  }
+
+  /**
+   * 长按菜单里由 SDK 判断的项（F-RCL-03 规则 6）：撤回、删除的消息和提示行没有菜单（空数组，AC-RCL-03-10）。
+   * 复制只有文本；引用要已发送的 text、image、file（F-QUO-01 规则 5）；撤回按 canRecall。
+   * 服务端关了 msgActions（GET /v1/config 的 features）时页面只留"复制"。
+   */
+  messageActions(m: Message, myRole?: GroupRole): MessageAction[] {
+    if (m.deleted || m.type === 'tip') return [];
+    const out: MessageAction[] = [];
+    if (m.type === 'text') out.push('copy');
+    if (m.status === 'sent' && m.msgId && (m.type === 'text' || m.type === 'image' || m.type === 'file')) {
+      out.push('quote');
+    }
+    if (this.canRecall(m, myRole)) out.push('recall');
+    return out;
+  }
+
+  /**
+   * 撤回文案要的判断数据（F-RCL-02 规则 1a，聊天页和列表摘要同一张表）：单聊 / 群、操作者是不是自己、被撤回的是不是自己的。
+   * m 是消息，或会话的 lastMsg。不是撤回的返回 null（后台删除显示"该消息已被删除"）。
+   */
+  recallNotice(convId: string, m: Pick<Message, 'from' | 'recalled' | 'recalledBy'> | LastMsg): RecallNotice | null {
+    return recallNoticeOf(convId, m, this.self);
+  }
+
+  /** 撤回文案（F-RCL-02 规则 1a 的表）：显示名按 displayName（备注只在本地显示，问题 19）。不是撤回的返回 null。 */
+  recallText(convId: string, m: Pick<Message, 'from' | 'recalled' | 'recalledBy'> | LastMsg): string | null {
+    const n = this.recallNotice(convId, m);
+    return n ? recallText(n, (u) => this.displayName(u)) : null;
   }
 
   /**
@@ -947,13 +1060,15 @@ export class IMClient extends Emitter<ClientEvents> {
         this.emit('convRemoved', ev.convId, ev.reason);
         return;
       case 'readUpdated':
+        // 另一端已读：提及数本地推算不了（不知道已读位置前后各有几条提及），有提及时重新拉 convs（F-MEN-03 规则 1）。
+        if (this.hasMentions(ev.convId)) this.refreshMentions();
         if (this.store.advanceRead(ev.convId, ev.readSeq)) this.emitConversations();
         return;
       case 'groupChanged':
         this.onGroupChanged(ev.groupId);
         return;
       case 'msgDeleted':
-        this.onMsgDeleted(ev.convId, ev.msgIds ?? [], ev.seqs ?? []);
+        this.onMsgDeleted(ev.convId, ev.msgIds ?? [], ev.seqs ?? [], recalledOf(ev.recalled));
         return;
       case 'muted':
         this.applyMute(ev.scope, ev.groupId, ev.mutedUntil ?? null);
@@ -974,14 +1089,15 @@ export class IMClient extends Emitter<ClientEvents> {
   }
 
   /**
-   * 消息被删除（PRD-admin F-ADM-31）：清除内存里的原文，摘要改成占位，未读不变。
+   * 消息被删除（PRD-admin F-ADM-31）或撤回（recall 不为空，PRD-chat F-RCL-03 规则 1）：清除内存里的原文和引用它的原文，
+   * 摘要改成占位，未读不变；文件通过 filesExpired 让页面丢掉缓存（规则 3）。这个会话有提及我的未读时重新拉 convs（F-MEN-03 规则 1）。
    * 还有没拿到 ack 的本地消息时（超时标记失败、ack 丢了），被删的可能正是其中一条：事件里只有 msgId 和 seq，
    * 要向服务端补拉才能按 clientMsgId 对上，并清掉发送队列里的那份原文。
    */
-  private onMsgDeleted(convId: string, msgIds: string[], seqs: number[]): void {
-    const changed = this.store.deleteMessages(convId, msgIds, seqs);
-    if (changed) this.emitMessages(convId);
-    this.emitConversations();
+  private onMsgDeleted(convId: string, msgIds: string[], seqs: number[], recall?: RecallInfo): void {
+    const mentioned = this.hasMentions(convId);
+    this.applyDeleted(convId, msgIds, seqs, recall);
+    if (mentioned) this.refreshMentions();
     const list = this.store.list(convId);
     const top = Math.max(0, ...seqs);
     const local = this.store.maxSeq(convId);
@@ -993,6 +1109,41 @@ export class IMClient extends Emitter<ClientEvents> {
       })
       .catch((err) => this.log.warn(`im: deleted sync failed: ${String(err)}`));
   }
+
+  private applyDeleted(convId: string, msgIds: string[], seqs: number[], recall?: RecallInfo): void {
+    if (this.store.deleteMessages(convId, msgIds, seqs, recall)) this.emitMessages(convId);
+    this.emitConversations();
+  }
+
+  private hasMentions(convId: string): boolean {
+    return (this.store.conversation(convId)?.mentionUnread ?? 0) > 0;
+  }
+
+  /** 按节流重新拉 convs 更新提及数（F-MEN-03 规则 1，R-CF-18）：窗口外立即拉；窗口内只记一次，窗口结束（上次拉取后 5 秒）时补拉。 */
+  private refreshMentions(): void {
+    if (this.mentionTimer !== null) return;
+    const wait = this.mentionFetchAt + MENTION_REFRESH_MS - this.clock.now();
+    if (wait <= 0) {
+      this.fetchMentions();
+      return;
+    }
+    this.mentionTimer = this.clock.setTimeout(() => {
+      this.mentionTimer = null;
+      this.fetchMentions();
+    }, wait);
+  }
+
+  private fetchMentions(): void {
+    if (this.conn.state !== 'connected') return; // 重连时的 convs 会带最新的计数
+    this.mentionFetchAt = this.clock.now();
+    this.conn
+      .request<ConvsAck>('convs', {})
+      .then((ack) => this.applyConvs(ack))
+      .catch((err) => this.log.warn(`im: mention refresh failed: ${String(err)}`));
+  }
+
+  private mentionFetchAt = -Infinity;
+  private mentionTimer: TimerHandle | null = null;
 
   /** 更新禁言表；不认识的 scope 忽略（协议 README 第 3 节规则 9）。until 为 undefined 表示解除。 */
   private applyMute(scope: unknown, groupId: unknown, until: number | null | undefined): void {
@@ -1058,6 +1209,7 @@ export class IMClient extends Emitter<ClientEvents> {
   private onMessage(m: ServerMessage): void {
     const prev = this.store.maxSeq(m.convId);
     if (!this.store.applyServerMessage(m)) return;
+    if (this.mentionsMe(m)) this.store.bumpMention(m.convId, m.seq);
     // 提示消息的摘要：本地按服务端同样的规则（只用昵称，F-SOC-29 规则 6）生成，下次 convs 时被权威文本覆盖。
     // 不在这里重拉 convs：大群里一次操作会让所有在线成员同时请求。
     if (m.type === 'tip' && m.body?.tip) {
@@ -1070,6 +1222,13 @@ export class IMClient extends Emitter<ClientEvents> {
     // 只对已经加载过的会话检测缺口：prev 为 0 说明本地还没有这个会话的消息。
     if (prev > 0 && m.seq > prev + 1) this.scheduleGapCheck(m.convId, prev, m.seq);
     if (m.convId === this.active) this.maybeReportRead();
+  }
+
+  /** 群消息 @ 了我或所有人（自己发的不算，F-MEN-03 规则 6）。 */
+  private mentionsMe(m: ServerMessage): boolean {
+    const men = m.body?.mentions;
+    if (!men || m.deleted || m.from === this.self || !m.convId.startsWith('group:')) return false;
+    return men.all === true || (men.userIds ?? []).includes(this.self);
   }
 
   /**
@@ -1188,7 +1347,9 @@ export class IMClient extends Emitter<ClientEvents> {
         ? { image: { fileId: m.body.image!.fileId } }
         : type === 'file'
           ? { file: { fileId: m.body.file!.fileId } }
-          : m.body;
+          : type === 'text'
+            ? textWire(m.body)
+            : m.body;
     const onAck = (ack: SendAck) => {
       this.sources.delete(clientMsgId); // 已发送：释放源（F-FILE-07 规则 2）
       // 正文在 ack 到的时候再取：等待期间消息可能已经被删除，回调不能留着一份原文。
@@ -1232,7 +1393,7 @@ export class IMClient extends Emitter<ClientEvents> {
           this.reupload(convId, clientMsgId);
           return;
         }
-        if (err instanceof IMError) this.fail(convId, clientMsgId, err.code);
+        if (err instanceof IMError) this.fail(convId, clientMsgId, err.code, err.reason);
         else if (err instanceof TimeoutError) this.fail(convId, clientMsgId, 'timeout');
         else if (
           (err instanceof ConnectionClosedError || err instanceof NotConnectedError) &&
@@ -1277,10 +1438,10 @@ export class IMClient extends Emitter<ClientEvents> {
     this.enqueueUpload(convId, clientMsgId);
   }
 
-  private fail(convId: string, clientMsgId: string, error: Message['error']): void {
+  private fail(convId: string, clientMsgId: string, error: Message['error'], reason?: string): void {
     const m = this.store.list(convId).local(clientMsgId);
     if (!m || m.status !== 'sending') return; // 已经被晚到的 ack 更新为已发送
-    this.store.list(convId).update(clientMsgId, { status: 'failed', error });
+    this.store.list(convId).update(clientMsgId, { status: 'failed', error, errorReason: reason });
     this.emitMessages(convId);
     if (error !== undefined) this.emit('sendFailed', convId, clientMsgId, error);
   }
@@ -1326,6 +1487,7 @@ export class IMClient extends Emitter<ClientEvents> {
     }
     this.lastRead = this.clock.now();
     this.store.advanceRead(convId, latest);
+    this.store.clearMentions(convId);
     this.emitConversations();
     this.conn.request('read', { convId, seq: latest }).catch((err) => this.log.warn(`im: read failed: ${String(err)}`));
   }
@@ -1390,6 +1552,9 @@ export class IMClient extends Emitter<ClientEvents> {
     this.gapTimers.clear();
     if (this.readTimer !== null) this.clock.clearTimeout(this.readTimer);
     this.readTimer = null;
+    if (this.mentionTimer !== null) this.clock.clearTimeout(this.mentionTimer);
+    this.mentionTimer = null;
+    this.mentionFetchAt = -Infinity;
     this.store = new Store(() => this.self);
     this.pushes.logout();
     this.mutes.clear();
@@ -1658,6 +1823,24 @@ export class IMClient extends Emitter<ClientEvents> {
     return ack;
   }
 
+  /**
+   * 搜索群成员（@ 选人，PRD-chat F-MEN-01 规则 6）：keyword 是 userId 前缀（区分大小写）或昵称前缀（ASCII 不区分大小写），
+   * 空串等于不搜索。每人每分钟 30 次（4290），不自动重试，抛 IMError 给页面。资料写进缓存。
+   */
+  async searchGroupMembers(
+    groupId: string,
+    keyword: string,
+    cursor?: string,
+  ): Promise<{ members: GroupMemberInfo[]; nextCursor: string }> {
+    const ack = await this.conn.request<{ members: GroupMemberInfo[]; nextCursor: string }>('groupMembers', {
+      groupId,
+      ...(keyword ? { keyword } : {}),
+      ...(cursor ? { cursor } : {}),
+    });
+    for (const m of ack.members) this.profiles.put(m);
+    return ack;
+  }
+
   private removeLocally(groupId: string, reason: string): void {
     const convId = groupConvId(groupId);
     this.store.removeConversation(convId, reason);
@@ -1808,4 +1991,29 @@ export class IMClient extends Emitter<ClientEvents> {
       document.removeEventListener('visibilitychange', visibility);
     };
   }
+}
+
+/** 上行的文本 body：引用只发 msgId（下行的 seq、state、text 都不发，Schema 不允许）。 */
+function textWire(body: Message['body']): Record<string, unknown> {
+  const out: Record<string, unknown> = { text: body.text };
+  if (body.quote) out.quote = { msgId: body.quote.msgId };
+  if (body.mentions) out.mentions = body.mentions;
+  return out;
+}
+
+/** userIds 去重、去空；什么都没有时返回 undefined（Schema 不允许空的 mentions）。 */
+function normalizeMentions(m: Mentions | undefined): Mentions | undefined {
+  if (!m) return undefined;
+  const userIds = [...new Set((m.userIds ?? []).filter((u) => u))];
+  const out: Mentions = {};
+  if (userIds.length) out.userIds = userIds;
+  if (m.all === true) out.all = true;
+  return out.userIds || out.all ? out : undefined;
+}
+
+function recalledOf(r: { by?: unknown; at?: unknown } | undefined): RecallInfo | undefined {
+  if (!r || typeof r !== 'object') return undefined;
+  const out: RecallInfo = { by: typeof r.by === 'string' ? r.by : '' };
+  if (typeof r.at === 'number') out.at = r.at;
+  return out;
 }

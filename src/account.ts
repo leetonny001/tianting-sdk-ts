@@ -32,12 +32,10 @@ export { SessionEndedError };
 /** 账号接口返回的错误：HTTP 状态 + {code, msg, reason?, details?}。 */
 export class AccountError extends IMError {
   readonly status: number;
-  readonly reason?: string;
   constructor(status: number, code: number, msg: string, reason?: string, details?: Readonly<Record<string, unknown>>) {
-    super(code, msg, undefined, details);
+    super(code, msg, undefined, details, reason);
     this.name = 'AccountError';
     this.status = status;
-    this.reason = reason;
   }
 }
 

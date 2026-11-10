@@ -34,12 +34,42 @@ export interface FileBody {
   expired?: boolean;
 }
 
+/**
+ * 引用的状态（PRD-chat F-QUO-02 规则 1）：normal 带 text；recalled、deleted、expired 没有原文。
+ * 将来可能有新的值：不认识的按"引用内容不可用"显示（quoteLabel）。
+ */
+export type QuoteState = 'normal' | 'recalled' | 'deleted' | 'expired' | (string & {});
+
+/**
+ * 下行的引用（F-QUO-01 规则 3、F-QUO-02），服务端下发时组装。原消息已不存在时 state=deleted，没有 seq、from、type。
+ * text 只在 state=normal 时有：文本前 100 个码点；图片"[图片]"；文件"[文件] {文件名}"。引用文字不进日志。
+ * 上行只发 {msgId}（send 的 quote 选项），SDK 本地待发的消息用已加载的原消息先拼一份同样的结构。
+ */
+export interface QuoteView {
+  msgId: string;
+  seq?: number;
+  from?: string;
+  type?: MsgType;
+  state: QuoteState;
+  text?: string;
+}
+
+/** @（F-MEN-01、02）：只在群聊、只有 text 能带。下发的是服务端过滤后的结果。 */
+export interface Mentions {
+  userIds?: string[];
+  all?: boolean;
+}
+
 export interface MsgBody {
   text?: string;
   data?: unknown;
   tip?: TipBody;
   image?: ImageBody;
   file?: FileBody;
+  /** 引用（C4）。 */
+  quote?: QuoteView;
+  /** @ 的人（C4）。 */
+  mentions?: Mentions;
 }
 
 export type MsgType = 'text' | 'custom' | 'tip' | 'image' | 'file';
@@ -57,8 +87,14 @@ export interface ServerMessage {
   /** 被删除的消息没有 body（PRD-core F-MSG-05 规则 7）。 */
   body?: MsgBody;
   ts: number;
+  /** 没有正文：后台删除，或撤回（这时 recalled 也是 true，PRD-chat F-RCL-01 规则 5a）。 */
   deleted?: boolean;
   deletedAt?: number;
+  /** 被撤回（C4）：只在为 true 时出现，同时 deleted=true、没有 body。 */
+  recalled?: boolean;
+  recalledAt?: number;
+  /** 撤回的操作者：发送者本人，或群主、管理员。 */
+  recalledBy?: string;
 }
 
 export interface LastMsg {
@@ -69,6 +105,9 @@ export interface LastMsg {
   text?: string;
   ts: number;
   deleted?: boolean;
+  /** 最后一条被撤回（F-RCL-03 规则 4，C4）：同时 deleted=true、没有 text、带 recalledBy。 */
+  recalled?: boolean;
+  recalledBy?: string;
 }
 
 /** convs 的一项、convAdded 的内容。 */
@@ -92,6 +131,10 @@ export interface ServerConversation {
   allMuted?: boolean;
   /** 已有消息的展示内容变化的版本号（C2：文件过期），变化时重拉这个会话（F-RCL-03 规则 2）。老服务端没有。 */
   modVer?: number;
+  /** 未读中提及我的数量，含 @ 所有人（F-MEN-03 规则 1，C4）。开关关闭或老服务端没有这个字段。 */
+  mentionUnread?: number;
+  /** 未读里第一条提及我的 seq；mentionUnread=0 时没有。 */
+  firstMentionSeq?: number;
 }
 
 export interface SendAck {
@@ -123,7 +166,7 @@ export interface AuthAck {
 export type ServerEvent =
   | { type: 'kicked'; reason: string; until?: number | null; recoverBefore?: number }
   | { type: 'securityNotice'; kind: string; at: number; platform: Platform }
-  | { type: 'msgDeleted'; convId: string; msgIds: string[]; seqs: number[] }
+  | { type: 'msgDeleted'; convId: string; msgIds: string[]; seqs: number[]; recalled?: { by: string; at: number } }
   | { type: 'muted'; scope: string; groupId?: string; mutedUntil: number | null }
   | { type: 'unmuted'; scope: string; groupId?: string }
   | { type: 'convAdded'; conv: ServerConversation }
@@ -138,7 +181,13 @@ export interface InboundFrame {
   id?: string;
   cmd: string;
   data?: unknown;
-  error?: { code: number; msg: string; userId?: string; details?: { userId?: string } & Record<string, unknown> };
+  error?: {
+    code: number;
+    msg: string;
+    userId?: string;
+    reason?: string;
+    details?: { userId?: string } & Record<string, unknown>;
+  };
 }
 
 /** 单聊会话 ID：c2c:{较小 userId}:{较大 userId}，按 ASCII 字节序比较（与服务端一致）。 */
