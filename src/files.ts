@@ -232,6 +232,8 @@ interface PendingUrl {
   item: FileUrlItem;
   resolve: (r: FileUrlResult) => void;
   reject: (e: Error) => void;
+  /** 排队时这个文件被 forget 过几次：之后又被 forget 的，迟到的地址不进缓存（问题 33）。 */
+  gen: number;
 }
 
 /**
@@ -248,6 +250,7 @@ export class FileClient {
   private queued: PendingUrl[] = [];
   private flushScheduled = false;
   private inflight = new Map<string, Promise<FileUrlResult>>();
+  private forgotten = new Map<string, number>();
 
   constructor(o: FileClientOptions) {
     this.auth = o.auth;
@@ -321,6 +324,7 @@ export class FileClient {
 
   /** 忘掉一个文件的地址（过期、撤回时，F-FILE-06 规则 3）。 */
   forget(fileId: string): void {
+    this.forgotten.set(fileId, (this.forgotten.get(fileId) ?? 0) + 1);
     for (const v of ['original', 'thumb'] as const) {
       this.urls.delete(key({ fileId, variant: v }));
       this.inflight.delete(key({ fileId, variant: v }));
@@ -342,7 +346,8 @@ export class FileClient {
     const same = this.inflight.get(k);
     if (same) return same;
     const p = new Promise<FileUrlResult>((resolve, reject) => {
-      this.queued.push({ item: { fileId: item.fileId, variant: item.variant }, resolve, reject });
+      const gen = this.forgotten.get(item.fileId) ?? 0;
+      this.queued.push({ item: { fileId: item.fileId, variant: item.variant }, resolve, reject, gen });
     });
     this.inflight.set(k, p);
     void p.then(
@@ -382,7 +387,8 @@ export class FileClient {
           ? items[i]
           : items.find((x) => x.fileId === g.item.fileId && x.variant === g.item.variant);
       if (r && typeof r.url === 'string' && typeof r.expiresAt === 'number') {
-        this.urls.set(key(g.item), { url: r.url, expiresAt: r.expiresAt });
+        if ((this.forgotten.get(g.item.fileId) ?? 0) === g.gen)
+          this.urls.set(key(g.item), { url: r.url, expiresAt: r.expiresAt });
         g.resolve({ ...g.item, url: r.url, expiresAt: r.expiresAt });
       } else {
         g.resolve({ ...g.item, code: typeof r?.code === 'number' ? r.code : 4048 });

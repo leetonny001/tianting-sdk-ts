@@ -114,6 +114,25 @@ export interface IMClientOptions {
   files?: FileClient;
 }
 
+/**
+ * 下载中途所在的消息被撤回（recalled）或删除、过期：已中止（AC-RCL-03-12，和 sdk-kotlin 同名）。
+ * H5 的下载交给浏览器之后停不了（frontend-chat 问题 16），SDK 这一段是取下载地址：地址还没交出去就中止。
+ */
+export class DownloadAbortedError extends Error {
+  constructor(
+    readonly fileId: string,
+    readonly recalled: boolean,
+  ) {
+    super(recalled ? 'download aborted: message recalled' : 'download aborted: file unavailable');
+    this.name = 'DownloadAbortedError';
+  }
+}
+
+/** 进行中的 downloadUrl：所在消息被撤回、删除或文件过期时由 emitMessages 中止。 */
+interface PendingDownload {
+  abort: (recalled: boolean) => void;
+}
+
 /** sendImage、sendFile 的选项。 */
 export interface AttachmentOptions {
   /** 上传进度：已发送字节、总字节（原图 + 缩略图）。 */
@@ -213,6 +232,11 @@ type ClientEvents = {
    * App 清掉按 fileId + variant 缓存的图片。
    */
   filesExpired: [fileIds: string[]];
+  /**
+   * 正在 downloadUrl 的文件所在的消息被撤回（recalled = true，AC-RCL-03-12：提示"该消息已被撤回"）或被删除、过期（false）：
+   * 下载已中止，downloadUrl 抛 DownloadAbortedError（和 sdk-kotlin 的 DownloadAborted 同名同义，问题 33）。先于 filesExpired。
+   */
+  downloadAborted: [fileId: string, recalled: boolean];
   /** 某人的资料变了，读 profileOf / displayName（F-ACC-06：自己改昵称后立即显示）。 */
   profileChanged: [userId: string];
 };
@@ -631,6 +655,32 @@ export class IMClient extends Emitter<ClientEvents> {
     let k = 0;
     return items.map((i) => (this.store.fileExpired(i.fileId) && !ask.includes(i) ? { ...i, code: 4048 } : got[k++]!));
   }
+
+  /**
+   * 下载原文件要用的地址（F-FILE-03 规则 3、4）：和 getFileUrls 一样（已知过期直接 code=4048，不发请求），
+   * 但取地址期间所在消息被撤回、删除或文件过期时抛 DownloadAbortedError，同时发 downloadAborted 事件（AC-RCL-03-12，
+   * 和 sdk-kotlin 的 download 一致，问题 33）。地址只交给浏览器下载，不要保存、打日志。
+   */
+  async downloadUrl(fileId: string): Promise<FileUrlResult> {
+    const item: FileUrlItem = { fileId, variant: 'original' };
+    if (this.store.fileExpired(fileId)) return { ...item, code: 4048 };
+    let d!: PendingDownload;
+    const aborted = new Promise<never>((_, reject) => {
+      d = { abort: (recalled) => reject(new DownloadAbortedError(fileId, recalled)) };
+    });
+    let set = this.downloads.get(fileId);
+    if (!set) this.downloads.set(fileId, (set = new Set()));
+    set.add(d);
+    try {
+      const [r] = await Promise.race([this.getFileUrls([item]), aborted]);
+      return r!;
+    } finally {
+      set.delete(d);
+      if (!set.size && this.downloads.get(fileId) === set) this.downloads.delete(fileId);
+    }
+  }
+
+  private downloads = new Map<string, Set<PendingDownload>>();
 
   private requireFiles(): FileClient {
     if (!this.files) throw new Error('files not configured: pass IMClientOptions.files');
@@ -1258,8 +1308,11 @@ export class IMClient extends Emitter<ClientEvents> {
         this.modVers.set(c.convId, c.modVer);
       }
       this.setGroupMute(c.convId, c.mutedUntil, c.allMuted);
-      // 错过了 msgDeleted 的话，摘要是唯一的线索：本地已加载的那条也要清掉。
-      if (c.lastMsg?.deleted && this.store.deleteMessages(c.convId, [c.lastMsg.msgId], [])) this.emitMessages(c.convId);
+      // 错过了 msgDeleted 的话，摘要是唯一的线索：本地已加载的那条也要清掉。带 recalled 的直接按撤回清
+      // （单调，只能从假变真；和 sdk-kotlin 一致，frontend-chat 问题 32）。
+      const last = c.lastMsg;
+      const recall: RecallInfo | undefined = last?.recalled === true ? { by: last.recalledBy ?? '' } : undefined;
+      if (last?.deleted && this.store.deleteMessages(c.convId, [last.msgId], [], recall)) this.emitMessages(c.convId);
     }
     for (const id of gone) this.setGroupMute(id, undefined);
     this.mutesChanged();
@@ -1521,9 +1574,17 @@ export class IMClient extends Emitter<ClientEvents> {
     this.knownLists.add(convId);
     this.emit('messages', convId, this.store.messages(convId));
     this.emitPendingCount();
+    const recalled = this.store.takeRecalledFiles();
     const expired = this.store.takeExpiredFiles();
     if (expired.length) {
       for (const id of expired) this.files?.forget(id);
+      for (const id of expired) {
+        const running = this.downloads.get(id);
+        if (!running) continue;
+        this.downloads.delete(id);
+        for (const d of running) d.abort(recalled.has(id));
+        this.emit('downloadAborted', id, recalled.has(id));
+      }
       this.emit('filesExpired', expired);
     }
   }

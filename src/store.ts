@@ -184,6 +184,8 @@ class MessageList {
   private expiredIds = new Set<string>();
   /** 这次合并里刚变成过期的 fileId，由 Store 取走（清缓存用）。 */
   newlyExpired: string[] = [];
+  /** 其中因撤回而失效的 fileId（newlyExpired 的子集）：取地址中的下载要中止并告诉页面是撤回（AC-RCL-03-12，问题 33）。 */
+  newlyRecalled: string[] = [];
   // 本地删除过的失败消息（G-UI-14）：它可能其实到了服务端，之后的 ack、sync 不能让它再出现。
   /** 用户删掉的失败消息：clientMsgId → 发送者。clientMsgId 只在同一发送者内唯一，别人用同样的值不能被拦。 */
   private removedClient = new Map<string, string>();
@@ -300,6 +302,8 @@ class MessageList {
 
   private wipe(old: Message, deletedAt?: number, recall?: RecallInfo): Message {
     this.noteExpired(old.body); // 文件的缓存同样要清（F-RCL-03 规则 3）
+    const id = old.body.image?.fileId || old.body.file?.fileId;
+    if (recall && id && !this.newlyRecalled.includes(id)) this.newlyRecalled.push(id);
     return this.replace(old, deletedMessage(old, deletedAt ?? old.deletedAt, recall));
   }
 
@@ -599,6 +603,16 @@ export class Store {
       if (!last.deleted || (recall && !last.recalled)) c.lastMsg = deletedLast(last, recall);
     }
     return changed;
+  }
+
+  /** 取走刚因撤回失效的文件的 fileId（takeExpiredFiles 的子集，要先取）。 */
+  takeRecalledFiles(): Set<string> {
+    const out = new Set<string>();
+    for (const l of this.msgs.values()) {
+      for (const id of l.newlyRecalled) out.add(id);
+      l.newlyRecalled = [];
+    }
+    return out;
   }
 
   /** 取走合并时刚变成过期（或被删除）的文件的 fileId：调用方清地址和文件缓存（F-FILE-06 规则 3、AC-FILE-06-12）。 */

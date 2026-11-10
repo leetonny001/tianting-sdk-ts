@@ -1470,6 +1470,22 @@ describe('HTTP 的基础约定（第 4.2、13.1 节）', () => {
     await expect(p).resolves.toEqual(cfg);
   });
 
+  it('问题 36（F-UI-09 规则 4）：features.msgActions 有类型声明，开、关、老服务端没有这个字段都能直接读', async () => {
+    for (const [features, want] of [
+      [{ files: true, msgActions: true }, true],
+      [{ files: true, msgActions: false }, false],
+      [{ files: true }, undefined],
+    ] as const) {
+      const h = setupAccount();
+      const p = h.account.getConfig();
+      await flush();
+      h.http.last('/v1/config').respond(200, { registerMode: 'open', demoLogin: false, features, limits: {} });
+      const cfg = await p;
+      const on: boolean | undefined = cfg.features.msgActions;
+      expect(on).toBe(want);
+    }
+  });
+
   it('token、refresh、恢复码、密码不进 URL、日志、事件和错误信息', async () => {
     const h = setupAccount();
     const secrets = new Set<string>(['Password-1', 'Password-2', 'CODE-SECRET', 'CODE-SECRET-2', 'INV-SECRET']);

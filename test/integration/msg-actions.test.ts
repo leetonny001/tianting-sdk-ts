@@ -2,6 +2,7 @@
 import { randomBytes } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
+  AccountClient,
   IMClient,
   IMError,
   WebSocketTransport,
@@ -108,6 +109,11 @@ async function sent(
 const byId = (im: IMClient, convId: string, msgId: string) => im.messages(convId).find((m) => m.msgId === msgId);
 
 describe('撤回 × 真实服务端', () => {
+  it('问题 36（F-UI-09 规则 4）：GET /v1/config 的 features.msgActions 按 AccountConfig 的类型读到 true', async () => {
+    const cfg = await new AccountClient({ baseUrl: srv.httpURL, platform: 'web' }).getConfig();
+    expect(cfg.features.msgActions).toBe(true);
+  });
+
   it('TC-RCL-01-01（AC-RCL-01-1）：u1 撤回：ack 成功；u2 和 u1 的另一端 2 秒内收到带 recalled 的 msgDeleted，文案各自正确，内存搜不到原文', async () => {
     const [u1, u2] = [uid('ra'), uid('rb')];
     await users(u1, u2);

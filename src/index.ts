@@ -1,5 +1,6 @@
 // IM 统一 SDK（TypeScript）。对外接口见 docs/sdk/README.md。
 export {
+  DownloadAbortedError,
   GROUP_RECALL_WINDOW_MS,
   IMClient,
   RECALL_WINDOW_MS,

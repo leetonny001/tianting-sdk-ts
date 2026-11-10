@@ -276,6 +276,51 @@ describe('撤回（F-RCL-01～03）', () => {
     expect(c.frames().filter((f) => f.cmd === 'sync')).toHaveLength(1);
   });
 
+  it('问题 32（F-RCL-03 规则 4）：错过了 msgDeleted，convs 的 lastMsg 带 recalled：已加载的那条直接按撤回清（和 sdk-kotlin 一致），只能从假变真', async () => {
+    const h = setup();
+    const [c1, c2] = ['c2c:alice:bob', 'c2c:alice:carol'];
+    h.im.connect('t');
+    let c = await h.login('alice', [
+      conv({ convId: c1, maxSeq: 1, modVer: 1 }),
+      conv({ convId: c2, maxSeq: 1, modVer: 1 }),
+    ]);
+    await loaded(h, c, c1, [m(c1, 1, 'bob', 'ZXQ-RCL-2 原文')]);
+    await loaded(h, c, c2, [m(c2, 1, 'carol', 'ZXQ-RCL-3 原文')]);
+    const reconnect = async (lastMsgs: Record<string, unknown>[]) => {
+      c.drop(1006);
+      await flush();
+      h.clock.advance(1_000);
+      await flush();
+      // modVer 没变（不重拉）：摘要是唯一的线索
+      c = await h.login('alice', [
+        conv({ convId: c1, maxSeq: 1, modVer: 1, lastMsg: lastMsgs[0] as never }),
+        conv({ convId: c2, maxSeq: 1, modVer: 1, lastMsg: lastMsgs[1] as never }),
+      ]);
+      await flush();
+    };
+    const gone = (convId: string, from: string, extra = {}) => ({
+      msgId: idOf(convId, 1),
+      from,
+      type: 'text',
+      ts: 1001,
+      deleted: true,
+      ...extra,
+    });
+    // c1 撤回；c2 后台删除
+    await reconnect([gone(c1, 'bob', { recalled: true, recalledBy: 'bob' }), gone(c2, 'carol')]);
+    expect(c.frames().filter((f) => f.cmd === 'sync')).toHaveLength(0);
+    expect(bySeq(h, c1, 1)).toMatchObject({ deleted: true, recalled: true, recalledBy: 'bob', body: {} });
+    expect(h.im.recallText(c1, bySeq(h, c1, 1))).toBe('对方撤回了一条消息');
+    expect(bySeq(h, c2, 1)).toMatchObject({ deleted: true, body: {} });
+    expect(bySeq(h, c2, 1).recalled).toBeUndefined();
+    expect(JSON.stringify(h.im.debugExport())).not.toContain('ZXQ-RCL-');
+    // 下一份 convs：c1 只带 deleted（老服务端）不会改回"已删除"；c2 补上 recalled，从后台删除变成撤回
+    await reconnect([gone(c1, 'bob'), gone(c2, 'carol', { recalled: true, recalledBy: 'carol' })]);
+    expect(bySeq(h, c1, 1)).toMatchObject({ deleted: true, recalled: true, recalledBy: 'bob' });
+    expect(bySeq(h, c2, 1)).toMatchObject({ deleted: true, recalled: true, recalledBy: 'carol' });
+    expect(h.im.recallText(c2, bySeq(h, c2, 1))).toBe('对方撤回了一条消息');
+  });
+
   it('TC-RCL-03-06（AC-RCL-03-6）：群里 u1 撤回自己的最后一条：u1 列表"你撤回了一条消息"，其他成员"{u1 显示名}撤回了一条消息"', async () => {
     for (const [self, want] of [
       ['u1', '你撤回了一条消息'],

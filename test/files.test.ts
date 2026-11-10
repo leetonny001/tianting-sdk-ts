@@ -1,7 +1,7 @@
 // FE-630：图片和文件（PRD-chat F-FILE-01、04、06、07，F-RCL-03 规则 2、2a）。
 // 假 HTTP + 假对象存储（FakeUpload）+ FakeTransport + 假时钟。测试名带 TC-FILE 编号。本地单测结果，CI 不运行。
 import { afterEach, describe, expect, it } from 'vitest';
-import { type Message, type ProcessedImage } from '../src/index.js';
+import { DownloadAbortedError, type Message, type ProcessedImage } from '../src/index.js';
 import { conv, flush, msg } from './helpers.js';
 import { HOUR, USER, accountSetup, jwt, type AccountHarness } from './support/account.js';
 import type { FakeHttpCall } from '../src/testing/index.js';
@@ -848,5 +848,97 @@ describe('TC-FILE-06-11 过期递增 modVer：只重拉这个会话，变"已过
     await flush();
     const syncs = c2.frames().filter((f) => f.cmd === 'sync');
     expect(syncs.map((f) => f.data!['convId']).sort()).toEqual([AB, G1].sort());
+  });
+});
+
+describe('TC-RCL-03-12（AC-RCL-03-12 的 SDK 部分，问题 33）：downloadUrl 取地址中所在消息被撤回、删除、过期时中止', () => {
+  const fileMsg = (seq: number, fileId: string, extra: Record<string, unknown> = {}) => ({
+    ...msg(AB, seq),
+    msgId: `m${seq}`,
+    type: 'file' as const,
+    body: { file: { fileId, name: SECRET_NAME, size: 100, mime: 'application/pdf', ...extra } },
+  });
+
+  const urlItem = (fileId: string, variant: 'original') => ({
+    fileId,
+    variant,
+    url: `https://s3.test/chat/final/${fileId}/${variant}?${SIG}`,
+    expiresAt: 1_800_000_000_000 + 120_000,
+  });
+
+  async function opened() {
+    const h = accountSetup();
+    current = h;
+    h.session(1, DAY);
+    h.im.connect(h.account.tokenProvider);
+    await flush();
+    const c = await h.login(USER, [conv({ convId: AB, maxSeq: 3, modVer: 1 })]);
+    void h.im.loadHistory(AB);
+    await flush();
+    c.ack('sync', { messages: [fileMsg(1, 'F1'), fileMsg(2, 'F2'), fileMsg(3, 'F3')], hasMore: false });
+    await flush();
+    const events: string[] = [];
+    h.im.on('downloadAborted', (id, recalled) => events.push(`aborted ${id} ${recalled}`));
+    h.im.on('filesExpired', (ids) => events.push(`expired ${ids.join(',')}`));
+    return { h, c, events };
+  }
+
+  it('对方撤回：抛 DownloadAbortedError(recalled=true)，先发 downloadAborted 再发 filesExpired；迟到的地址不交出去', async () => {
+    const { h, c, events } = await opened();
+    const p = h.im.downloadUrl('F1');
+    p.catch(() => undefined);
+    const other = h.im.downloadUrl('F2');
+    await flush();
+    c.receive({
+      cmd: 'event',
+      data: { type: 'msgDeleted', convId: AB, msgIds: ['m1'], seqs: [1], recalled: { by: 'bob', at: 9 } },
+    });
+    await flush();
+    const e = await p.catch((x: unknown) => x);
+    expect(e).toBeInstanceOf(DownloadAbortedError);
+    expect(e).toMatchObject({ fileId: 'F1', recalled: true, message: 'download aborted: message recalled' });
+    expect(events).toEqual(['aborted F1 true', 'expired F1']);
+    // 一批里的 F2 不受影响
+    h.http.last(URLS).respond(200, { items: [urlItem('F1', 'original'), urlItem('F2', 'original')] });
+    expect((await other).url).toContain('F2');
+    // 迟到的 F1 地址没有进缓存：再要 F1 会重新问服务端（撤回后是 4048）
+    const n = h.http.to(URLS).length;
+    const again = h.im.downloadUrl('F1');
+    await flush();
+    expect(h.http.to(URLS)).toHaveLength(n + 1);
+    h.http.last(URLS).respond(200, { items: [{ fileId: 'F1', variant: 'original', code: 4048 }] });
+    expect(await again).toEqual({ fileId: 'F1', variant: 'original', code: 4048 });
+    expect(events).toHaveLength(2);
+  });
+
+  it('后台删除（recalled=false）和文件过期（recalled=false）同样中止；正常下载不发事件', async () => {
+    const { h, c, events } = await opened();
+    const ok = h.im.downloadUrl('F3');
+    await flush();
+    h.http.last(URLS).respond(200, { items: [urlItem('F3', 'original')] });
+    expect((await ok).url).toContain('F3');
+    expect(events).toEqual([]);
+
+    const del = h.im.downloadUrl('F1');
+    del.catch(() => undefined);
+    await flush();
+    c.receive({ cmd: 'event', data: { type: 'msgDeleted', convId: AB, msgIds: ['m1'], seqs: [1] } });
+    await flush();
+    await expect(del).rejects.toMatchObject({ name: 'DownloadAbortedError', fileId: 'F1', recalled: false });
+    expect(events).toEqual(['aborted F1 false', 'expired F1']);
+
+    // 过期：重连后 modVer 变了，重拉到 expired=true
+    const exp = h.im.downloadUrl('F2');
+    exp.catch(() => undefined);
+    await flush();
+    c.drop(1006);
+    h.clock.advance(1_000);
+    await flush();
+    const c2 = await h.login(USER, [conv({ convId: AB, maxSeq: 3, modVer: 2 })]);
+    c2.ack('sync', { messages: [fileMsg(2, 'F2', { expired: true, name: '' })], hasMore: false });
+    await flush();
+    await expect(exp).rejects.toMatchObject({ fileId: 'F2', recalled: false });
+    expect(events.slice(2)).toEqual(['aborted F2 false', 'expired F2']);
+    for (const call of h.http.to(URLS).filter((x) => !x.settled)) call.respond(200, { items: [] });
   });
 });
