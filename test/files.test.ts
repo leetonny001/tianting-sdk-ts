@@ -625,6 +625,8 @@ describe('取地址：一屏合并成一批，地址缓存（F-FILE-04 规则 1�
     await flush();
     expect(h.http.to(URLS)).toHaveLength(1);
     expect(h.http.last(URLS).json['items']).toEqual([{ fileId: 'F1', variant: 'original' }]);
+    // H5 下载要文件名：不带 bareDisposition（PRD-chat v1.7 F-FILE-03 规则 4，P-45，TC-FILE-01-25 第 3 步）
+    expect(h.http.last(URLS).json).not.toHaveProperty('bareDisposition');
     h.http.last(URLS).respond(200, { items: [urlItem('F1', 'original')] });
     expect((await a)[0]!.url).toBe((await b)[0]!.url);
   });
