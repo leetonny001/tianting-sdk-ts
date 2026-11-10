@@ -96,14 +96,12 @@ class Runner {
       this.h.upload.pending[0]!.respond(200);
       await flush();
     }
-    this.h.http
-      .last(`/v1/files/${fileId}/complete`)
-      .respond(200, {
-        fileId,
-        size: 1000,
-        mime: thumb ? 'image/jpeg' : 'application/pdf',
-        ...(thumb ? { width: 40, height: 30 } : {}),
-      });
+    this.h.http.last(`/v1/files/${fileId}/complete`).respond(200, {
+      fileId,
+      size: 1000,
+      mime: thumb ? 'image/jpeg' : 'application/pdf',
+      ...(thumb ? { width: 40, height: 30 } : {}),
+    });
     await flush();
   }
 

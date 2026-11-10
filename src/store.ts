@@ -348,6 +348,17 @@ class MessageList {
     return changed;
   }
 
+  /**
+   * 服务端的 minSeq 变小了（重新入群按新成员算，historyVisible=true 时能看到全部历史，F-CVS-03 规则 6a，frontend-chat 第 65 条）：
+   * 放低本地下限，之前清除范围里的旧历史又可以加载。
+   */
+  lowerFloor(minSeq: number): void {
+    const next = Math.max(1, minSeq);
+    if (next >= this.floor) return;
+    this.floor = next;
+    this.hasMoreHistory = true;
+  }
+
   /** 按 msgId 找已加载的消息（引用、撤回用）。 */
   findByMsgId(msgId: string): Message | undefined {
     if (!this.byMsgId.has(msgId)) return undefined;
@@ -497,7 +508,12 @@ export class Store {
         }
       }
     }
-    for (const id of next.keys()) this.snapshots.delete(id);
+    for (const [id, c] of next) {
+      // 服务端的 minSeq 比本地下限小只有一种情况：重新入群按新成员算（规则 6a）。被移出、再加入可能都发生在离线期间，
+      // 本地没有快照也没有收到 convRemoved，所以不看快照，按服务端的值放低（frontend-chat 第 65 条）。
+      this.msgs.get(id)?.lowerFloor(c.minSeq);
+      this.snapshots.delete(id);
+    }
     this.convs = next;
     this.hidden = hidden;
     this.placeholders.clear();
@@ -583,9 +599,14 @@ export class Store {
   /** 最近一次 convs 是否被截断（超过 500 个会话，C-03）。 */
   truncated = false;
 
+  /**
+   * 服务端下发的完整会话（convAdded、convSet 的 ack 等）。服务端的 minSeq 比本地下限小（重新入群，规则 6a）时放低下限，
+   * 旧历史可以重新加载（frontend-chat 第 65 条）。按 minSeq 的清除由调用方做。
+   */
   upsertConversation(c: ServerConversation): void {
     this.convs.set(c.convId, this.fromServer(c));
     this.hidden.delete(c.convId);
+    this.msgs.get(c.convId)?.lowerFloor(c.minSeq);
     this.placeholders.delete(c.convId);
     this.snapshots.delete(c.convId); // 重新被拉进群：清除快照（G-UI-21 ③）
   }
@@ -907,12 +928,15 @@ function applySettings(c: ConvState, s: ConvSettings): void {
 
 const byConvId = (a: Conversation, b: Conversation) => (a.convId < b.convId ? -1 : a.convId > b.convId ? 1 : 0);
 
-/** F-CVS-01 规则 3：置顶在前按 pinnedAt 倒序，其余 updatedAt 倒序，同时间 convId 升序。 */
+/**
+ * F-CVS-01 规则 3：置顶在前按 pinnedAt 倒序，其余 updatedAt 倒序，同时间 convId 升序。
+ * 置顶时间相同时再按 updatedAt 倒序、convId 升序（和 Go 参考实现 server/e2e/chatmodel/convs.go 的 Conversations 一致）。
+ */
 function compareConvs(a: Conversation, b: Conversation): number {
   const pa = a.pinned === true;
   const pb = b.pinned === true;
   if (pa !== pb) return pa ? -1 : 1;
-  if (pa) return (b.pinnedAt ?? 0) - (a.pinnedAt ?? 0) || byConvId(a, b);
+  if (pa && a.pinnedAt !== b.pinnedAt) return (b.pinnedAt ?? 0) - (a.pinnedAt ?? 0);
   return b.updatedAt - a.updatedAt || byConvId(a, b);
 }
 

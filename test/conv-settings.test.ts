@@ -84,15 +84,18 @@ const ids = (h: Harness) => h.im.conversations().map((x) => x.convId);
 const find = (h: Harness, convId: string) => h.im.conversations().find((x) => x.convId === convId);
 
 describe('F-CVS-01 置顶', () => {
-  it('TC-CVS-01-01（F-CVS-01 规则 3）：置顶的在最前按 pinnedAt 倒序，其余 updatedAt 倒序、同时间 convId 升序；引用稳定', async () => {
+  it('TC-CVS-01-01（F-CVS-01 规则 3）：置顶的在最前按 pinnedAt 倒序（相同时 updatedAt 倒序、convId 升序），其余 updatedAt 倒序、同时间 convId 升序；引用稳定', async () => {
     const [h] = await online([
       sc({ convId: AB, updatedAt: 300 }),
       sc({ convId: AC, updatedAt: 100 }),
       sc({ convId: G1, updatedAt: 50, pinned: true, pinnedAt: 10 }),
       sc({ convId: G2, updatedAt: 1, pinned: true, pinnedAt: 20 }),
       sc({ convId: 'c2c:alice:dave', updatedAt: 100 }),
+      // 置顶时间相同：再按 updatedAt 倒序、convId 升序（Go 参考实现 chatmodel.Conversations）。
+      sc({ convId: 'group:g3', updatedAt: 5, pinned: true, pinnedAt: 20 }),
+      sc({ convId: 'group:g4', updatedAt: 5, pinned: true, pinnedAt: 20 }),
     ]);
-    expect(ids(h)).toEqual([G2, G1, AB, AC, 'c2c:alice:dave']);
+    expect(ids(h)).toEqual(['group:g3', 'group:g4', G2, G1, AB, AC, 'c2c:alice:dave']);
     const a = h.im.conversations();
     expect(h.im.conversations()).toBe(a); // 没有变化时同一个数组（G-UI-19）
   });
@@ -541,6 +544,107 @@ describe('F-CVS-03 删除会话', () => {
     down(c, { cmd: 'msg', data: m(AB, 3) });
     await flush();
     expect(find(h, AB)).toMatchObject({ notifyOff: true, unread: 1 });
+  });
+});
+
+describe('F-CVS-03 规则 6a 重新入群（frontend-chat 第 65 条，AC-CVS-03-12 的客户端侧）', () => {
+  /** 删除 g1 到 10（本地下限 11），之后被移出。 */
+  async function deletedThenRemoved(): Promise<[Harness, FakeConnection]> {
+    const [h, c] = await online([sc({ convId: G1, maxSeq: 10, readSeq: 10, updatedAt: 10 })]);
+    await loaded(
+      h,
+      c,
+      G1,
+      [9, 10].map((s) => m(G1, s, 'bob', `ZXQ-CVS-8 ${s}`)),
+    );
+    const p = h.im.deleteConv(G1);
+    ack(c, 'convDelete', { clearedSeq: 10 });
+    await p;
+    expect(h.im.messages(G1)).toEqual([]);
+    return [h, c];
+  }
+
+  async function olderHistoryLoads(h: Harness, c: FakeConnection): Promise<void> {
+    void h.im.loadHistory(G1);
+    await flush();
+    expect(c.last('sync').data).toMatchObject({ convId: G1, beforeSeq: 11 });
+    ack(c, 'sync', { messages: [8, 9, 10].map((s) => m(G1, s, 'bob', `旧历史 ${s}`)), hasMore: true });
+    await flush();
+    expect(h.im.messages(G1).map((x) => x.seq)).toEqual([8, 9, 10]);
+    expect(JSON.stringify(h.im.debugExport())).not.toContain('ZXQ-CVS-8'); // 之前清除的副本没有回来，回来的是重新拉到的
+  }
+
+  it('在线：convRemoved 后 convAdded 的 minSeq=1（historyVisible=true）：下限放低，清除范围里的旧历史可以重新加载', async () => {
+    const [h, c] = await deletedThenRemoved();
+    event(c, { type: 'convRemoved', convId: G1, reason: 'removed' });
+    event(c, {
+      type: 'convAdded',
+      conv: sc({ convId: G1, maxSeq: 10, readSeq: 10, minSeq: 1, updatedAt: 11 }),
+    });
+    expect(find(h, G1)).toMatchObject({ minSeq: 1 });
+    await olderHistoryLoads(h, c);
+  });
+
+  it('离线期间被移出又加入（本地没有快照、没有收到 convRemoved）：重连 convs 的 minSeq 比本地下限小，同样放低', async () => {
+    const [h, c] = await deletedThenRemoved();
+    const n = await reconnect(h, c, {
+      convs: [sc({ convId: G1, maxSeq: 10, readSeq: 10, minSeq: 1, updatedAt: 11 })],
+      truncated: false,
+    });
+    expect(find(h, G1)).toMatchObject({ minSeq: 1 });
+    await olderHistoryLoads(h, n);
+  });
+
+  it('删除后还留着更新的消息（翻页已到底）：重新入群放低下限后又可以往前翻', async () => {
+    const [h, c] = await online([sc({ convId: G1, maxSeq: 10, readSeq: 10, updatedAt: 10 })]);
+    await loaded(
+      h,
+      c,
+      G1,
+      [9, 10].map((s) => m(G1, s)),
+    );
+    down(c, { cmd: 'msg', data: m(G1, 11) });
+    event(c, { type: 'convDeleted', convId: G1, clearedSeq: 10 });
+    await flush();
+    expect(h.im.messages(G1).map((x) => x.seq)).toEqual([11]);
+    const n = c.frames().length;
+    await expect(h.im.loadHistory(G1)).resolves.toBe(false); // 到 minSeq 了，不发请求
+    expect(c.frames().length).toBe(n);
+    event(c, { type: 'convAdded', conv: sc({ convId: G1, maxSeq: 11, readSeq: 11, minSeq: 1, updatedAt: 11 }) });
+    void h.im.loadHistory(G1);
+    await flush();
+    expect(c.last('sync').data).toMatchObject({ convId: G1, beforeSeq: 11 });
+    ack(c, 'sync', { messages: [m(G1, 10)], hasMore: true });
+    await flush();
+    expect(h.im.messages(G1).map((x) => x.seq)).toEqual([10, 11]);
+  });
+
+  it('convAdded 的 minSeq 比已加载的大（重新入群、historyVisible=false）：按它清除', async () => {
+    const [h, c] = await online([sc({ convId: G1, maxSeq: 6, readSeq: 6, updatedAt: 6 })]);
+    await loaded(
+      h,
+      c,
+      G1,
+      [1, 2, 3, 4, 5, 6].map((s) => m(G1, s, 'bob', `ZXQ-CVS-9 ${s}`)),
+    );
+    event(c, { type: 'convRemoved', convId: G1, reason: 'removed' });
+    event(c, { type: 'convAdded', conv: sc({ convId: G1, maxSeq: 6, readSeq: 6, minSeq: 5, updatedAt: 7 }) });
+    await flush();
+    expect(h.im.messages(G1).map((x) => x.seq)).toEqual([5, 6]);
+    expect(JSON.stringify(h.im.debugExport())).not.toContain('ZXQ-CVS-9 4');
+  });
+
+  it('对照：服务端 minSeq 还是 clearedSeq + 1 时下限不动，迟到的旧消息照样不写进来', async () => {
+    const [h, c] = await deletedThenRemoved();
+    const n = await reconnect(h, c, {
+      convs: [sc({ convId: G1, maxSeq: 12, readSeq: 10, unread: 2, minSeq: 11, updatedAt: 12 })],
+      truncated: false,
+    });
+    void h.im.loadHistory(G1);
+    await flush();
+    ack(n, 'sync', { messages: [9, 10, 11, 12].map((s) => m(G1, s)), hasMore: false });
+    await flush();
+    expect(h.im.messages(G1).map((x) => x.seq)).toEqual([11, 12]);
   });
 });
 

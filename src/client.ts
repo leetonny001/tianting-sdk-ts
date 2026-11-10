@@ -1190,6 +1190,7 @@ export class IMClient extends Emitter<ClientEvents> {
         return;
       case 'convAdded':
         this.store.upsertConversation(ev.conv);
+        if (this.store.purgeConversation(ev.conv.convId, ev.conv.minSeq)) this.emitMessages(ev.conv.convId);
         this.setGroupMute(ev.conv.convId, ev.conv.mutedUntil, ev.conv.allMuted);
         this.mutesChanged();
         this.emitConversations();

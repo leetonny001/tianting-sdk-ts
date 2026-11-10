@@ -199,4 +199,34 @@ describe('会话设置 × 真实服务端', () => {
     expect(d2.messages(c2)).toEqual([]);
     expect(JSON.stringify(d2.debugExport())).not.toContain('ZXQ-CVS-7');
   });
+
+  it('TC-CVS-03-12（AC-CVS-03-12 的客户端侧，frontend-chat 第 65 条）：删除 g1 后在同一次登录里被移出再加入（historyVisible=true）：本地下限放低，能加载到全部历史', async () => {
+    const [u1, u2] = [uid('ha'), uid('hb')];
+    await users(u1, u2);
+    const groupId = uid('h');
+    await srv.admin('POST', '/admin/groups', { groupId, name: groupId, members: [u1, u2], historyVisible: true });
+    const g = `group:${groupId}`;
+    const [a, b] = [await login(u1), await login(u2)];
+    for (let i = 1; i <= 3; i++) await sent(b, g, `历史 ${i}`);
+    await until(() => convOf(a, g)?.maxSeq === 3, 'u1 has 3');
+    await a.loadHistory(g);
+    await a.deleteConv(g);
+    expect(a.messages(g)).toEqual([]);
+    const removed: string[] = [];
+    a.on('convRemoved', (id) => removed.push(id));
+    await srv.admin('DELETE', `/admin/groups/${groupId}/members`, { members: [u1] });
+    await until(() => removed.includes(g), 'convRemoved');
+    await srv.admin('POST', `/admin/groups/${groupId}/members`, { members: [u1] });
+    await until(() => convOf(a, g), 'convAdded');
+    expect(convOf(a, g)!.minSeq).toBe(1);
+    while (await a.loadHistory(g)) {
+      /* 翻到底 */
+    }
+    expect(
+      a
+        .messages(g)
+        .filter((m) => m.type === 'text')
+        .map((m) => m.body.text),
+    ).toEqual(['历史 1', '历史 2', '历史 3']);
+  });
 });

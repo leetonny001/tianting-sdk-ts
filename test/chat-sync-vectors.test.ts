@@ -1,10 +1,12 @@
 // TC-CHAT-90-13（AC-CHAT-90-15）、TC-FILE-06-11（AC-FILE-06-12）：共享用例 protocol/vectors/chat-sync.json。
 // C4（FE-660）：TC-RCL-03-13（AC-RCL-03-13）、TC-QUO-02-02（AC-QUO-02-2）、TC-QUO-02-06（AC-QUO-02-6）、TC-MEN-03-07（AC-MEN-03-7）
 // 的同名用例也在这里跑：步骤 event、advance，期望 convsFetches、mentionUnread。
+// C5（FE-680，BE-487）：TC-CHAT-90-39（AC-CHAT-90-15）：置顶排序、deleted 判断、本地清除、convDeleted 之后的状态、总未读；
+// connect 带 truncated、deleted、deletedTruncated，期望 conversations、convState、removed、totalUnread。
 // 真实的 IMClient + FakeTransport + 假时钟：connect 真的是重连后的 convs 应答，SDK 发出的每个 sync 都按 convId 回复。
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import type { Message } from '../src/index.js';
+import type { Conversation, Message } from '../src/index.js';
 import type { MsgBody, ServerConversation, ServerMessage } from '../src/protocol.js';
 import type { FakeConnection } from '../src/testing/index.js';
 import { conv, flush, setup, type Harness } from './helpers.js';
@@ -31,6 +33,19 @@ interface VConv {
   maxSeq: number;
   modVer?: number;
   mentionUnread?: number;
+  minSeq?: number;
+  unread?: number;
+  updatedAt?: number;
+  pinned?: boolean;
+  pinnedAt?: number;
+  notifyOff?: boolean;
+}
+interface VConvState {
+  minSeq: number;
+  unread: number;
+  pinned?: boolean;
+  pinnedAt?: number;
+  notifyOff?: boolean;
 }
 interface Step {
   op: 'connect' | 'disconnect' | 'load' | 'event' | 'advance';
@@ -41,12 +56,19 @@ interface Step {
   messages?: VMsg[];
   event?: Record<string, unknown>;
   ms?: number;
+  truncated?: boolean;
+  deleted?: Array<{ convId: string; clearedSeq: number }>;
+  deletedTruncated?: boolean;
   expect?: {
     syncs?: string[];
     filesExpired: string[];
     messages: Record<string, VMsg[]>;
     convsFetches?: number;
     mentionUnread?: Record<string, number>;
+    conversations?: string[];
+    convState?: Record<string, VConvState>;
+    removed?: string[];
+    totalUnread?: number;
   };
 }
 
@@ -93,11 +115,17 @@ function wire(convId: string, m: VMsg): ServerMessage {
   return { ...base, body };
 }
 
+/** 会话的写法（format 的"会话"）：C5 的 unread 不为 0 时 readSeq = maxSeq − unread，和服务端的算法一致。 */
 function wireConv(c: VConv): ServerConversation {
   return conv({
     convId: c.convId,
     maxSeq: c.maxSeq,
-    readSeq: c.maxSeq,
+    readSeq: c.maxSeq - (c.unread ?? 0),
+    minSeq: c.minSeq ?? 1,
+    unread: c.unread ?? 0,
+    updatedAt: c.updatedAt ?? 0,
+    ...(c.pinned ? { pinned: true, pinnedAt: c.pinnedAt! } : {}),
+    ...(c.notifyOff ? { notifyOff: true } : {}),
     ...(c.modVer !== undefined ? { modVer: c.modVer } : {}),
     ...(c.mentionUnread !== undefined ? { mentionUnread: c.mentionUnread } : {}),
     ...(c.mentionUnread ? { firstMentionSeq: c.maxSeq } : {}),
@@ -133,9 +161,23 @@ const TC: Readonly<Record<string, string>> = {
   'AC-QUO-02-6': 'TC-QUO-02-06',
   'AC-MEN-03-7': 'TC-MEN-03-07',
 };
+/** AC-CVS-03-5 → TC-CVS-03-05（docs/testcases/TC-CVS.md 按 AC 编号对齐）。 */
+const cvsTc = (a: string) =>
+  a.replace(/^AC-CVS-(\d\d)-(\d+)$/, (_, x: string, y: string) => `TC-CVS-${x}-${y.padStart(2, '0')}`);
 function tcOf(acs: string[]): string {
+  const c5 = acs.some((a) => a.startsWith('AC-CVS-'));
   const c4 = acs.some((a) => /^AC-(QUO|MEN)-|^AC-RCL-03-13$/.test(a));
-  return [c4 ? 'TC-CHAT-90-33' : 'TC-CHAT-90-13', ...acs.map((a) => TC[a] ?? a)].join(' ');
+  const head = c5 ? 'TC-CHAT-90-39' : c4 ? 'TC-CHAT-90-33' : 'TC-CHAT-90-13';
+  return [head, ...acs.map((a) => TC[a] ?? cvsTc(a))].join(' ');
+}
+
+/** SDK 列表里每个会话和用例有关的状态（convState）。 */
+function convState(x: Conversation): VConvState {
+  const out: VConvState = { minSeq: x.minSeq, unread: x.unread };
+  if (x.pinned) out.pinned = true;
+  if (x.pinnedAt !== undefined) out.pinnedAt = x.pinnedAt;
+  if (x.notifyOff) out.notifyOff = true;
+  return out;
 }
 
 class Runner {
@@ -190,6 +232,8 @@ class Runner {
 
   /** 这一步里 SDK 发过的 convs 次数（event、advance）。 */
   fetches = 0;
+  /** 用例里出现过的会话（removed 在这些里面找快照）。 */
+  seen = new Set<string>();
 
   async step(st: Step): Promise<string[] | undefined> {
     this.expired = [];
@@ -202,8 +246,19 @@ class Runner {
         } else {
           this.h.im.connect('token-value');
         }
-        this.c = await this.h.login(spec.self, (st.convs ?? []).map(wireConv));
-        // login 已经回了这条连接的 convs。
+        this.c = this.h.transport.current;
+        this.c.open();
+        this.c.ack('auth', { userId: spec.self, serverTime: this.h.clock.now() });
+        await flush();
+        for (const c of st.convs ?? []) this.seen.add(c.convId);
+        for (const d of st.deleted ?? []) this.seen.add(d.convId);
+        this.c.ack('convs', {
+          convs: (st.convs ?? []).map(wireConv),
+          truncated: st.truncated === true,
+          ...(st.deleted ? { deleted: st.deleted } : {}),
+          ...(st.deletedTruncated ? { deletedTruncated: true } : {}),
+        });
+        await flush();
         for (const f of this.c.frames()) if (f.cmd === 'convs') this.answered.add(f.id!);
         return this.drain((id) =>
           st.errors?.[id] !== undefined ? { code: st.errors[id]! } : { messages: st.replies?.[id] ?? [] },
@@ -220,6 +275,7 @@ class Runner {
         return undefined;
       case 'event':
         this.c!.receive({ cmd: 'event', data: st.event });
+        if (typeof st.event?.['convId'] === 'string') this.seen.add(st.event['convId']);
         await flush();
         this.fetches = await this.answerConvs(st);
         return this.drain(() => ({ messages: [] }));
@@ -247,8 +303,24 @@ describe('TC-CHAT-90-13 chat-sync.json（F-RCL-03 规则 2、2a：单调合并�
   it('C4 的用例都在（BE-478）：撤回合并、引用清除、提及计数，用到 event 和 advance', () => {
     const acs = spec.cases.flatMap((c) => c.acs);
     for (const ac of ['AC-RCL-03-13', 'AC-QUO-02-2', 'AC-QUO-02-6', 'AC-MEN-03-7']) expect(acs).toContain(ac);
-    expect(spec.cases.filter((c) => c.steps.some((s) => s.op === 'event' || s.op === 'advance')).length).toBe(4);
-    expect(spec.cases.length).toBe(13); // C2 7 个 + C4 6 个
+    const c4 = spec.cases.filter((c) => !c.acs.some((a) => a.startsWith('AC-CVS-')));
+    expect(c4.filter((c) => c.steps.some((s) => s.op === 'event' || s.op === 'advance')).length).toBe(4);
+    expect(spec.cases.filter((c) => !c.acs.some((a) => a.startsWith('AC-CVS-'))).length).toBe(13); // C2 7 个 + C4 6 个
+  });
+
+  it('C5 的用例都在（BE-487）：置顶排序、deleted 判断、truncated / deletedTruncated、本地清除、convDeleted、总未读', () => {
+    const c5 = spec.cases.filter((c) => c.acs.some((a) => a.startsWith('AC-CVS-')));
+    expect(c5).toHaveLength(6);
+    const acs = c5.flatMap((c) => c.acs);
+    for (const ac of ['AC-CVS-01-1', 'AC-CVS-03-5', 'AC-CVS-03-2', 'AC-CVS-04-5', 'AC-CVS-02-5', 'AC-CVS-04-1']) {
+      expect(acs).toContain(ac);
+    }
+    const steps = c5.flatMap((c) => c.steps);
+    expect(steps.some((s) => s.deletedTruncated)).toBe(true);
+    expect(steps.some((s) => s.truncated)).toBe(true);
+    expect(steps.some((s) => s.event?.['type'] === 'convDeleted')).toBe(true);
+    expect(steps.some((s) => s.event?.['type'] === 'convSettingsChanged')).toBe(true);
+    expect(steps.filter((s) => s.expect?.conversations).length).toBeGreaterThan(0);
   });
 
   for (const c of spec.cases) {
@@ -275,12 +347,29 @@ describe('TC-CHAT-90-13 chat-sync.json（F-RCL-03 规则 2、2a：单调合并�
           );
           expect(got, `${at} mentionUnread`).toEqual(st.expect.mentionUnread);
         }
+        if (st.expect.conversations) {
+          expect(
+            h.im.conversations().map((x) => x.convId),
+            `${at} conversations`,
+          ).toEqual(st.expect.conversations);
+        }
+        if (st.expect.convState) {
+          const got = Object.fromEntries(h.im.conversations().map((x) => [x.convId, convState(x)]));
+          expect(got, `${at} convState`).toEqual(st.expect.convState);
+        }
+        if (st.expect.removed) {
+          const got = [...r.seen].filter((id) => h.im.conversationSnapshot(id)).sort();
+          expect(got, `${at} removed`).toEqual(st.expect.removed);
+        }
+        if (st.expect.totalUnread !== undefined) {
+          expect(h.im.totalUnread(), `${at} totalUnread`).toBe(st.expect.totalUnread);
+        }
       }
       // 过期的文件名、撤回的原文、引用的原文不留在内存里（F-FILE-06 规则 3、F-RCL-03 规则 3、F-QUO-02 规则 4）：
       // 最后一步期望里没有的特征串，导出里也没有。
       const last = JSON.stringify(c.steps.filter((s) => s.expect).at(-1)!.expect!);
       const dump = JSON.stringify(h.im.debugExport());
-      for (const mark of ['ZXQ-FILE-NAME', 'ZXQ-RCL-2', 'ZXQ-QUO-1']) {
+      for (const mark of ['ZXQ-FILE-NAME', 'ZXQ-RCL-2', 'ZXQ-QUO-1', 'ZXQ-CVS-1']) {
         if (!last.includes(mark)) expect(dump, mark).not.toContain(mark);
       }
     });

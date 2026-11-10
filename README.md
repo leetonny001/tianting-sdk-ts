@@ -144,11 +144,12 @@ im.totalUnread();                               // 普通会话的 unread 之和
 im.on('convDeleted', (convId) => …);            // 本端删除成功或其他设备删除了它：页面清这个会话的草稿
 ```
 
-`Conversation` 增加 `pinned`、`pinnedAt`、`notifyOff`（没有时不带，按 false）；`conversations()` 置顶的在前（`pinnedAt` 倒序），
-其余 `updatedAt` 倒序，同时间按 `convId`。其他设备改的设置由 `convSettingsChanged` 覆盖本地。
+`Conversation` 增加 `pinned`、`pinnedAt`、`notifyOff`（没有时不带，按 false）；`conversations()` 置顶的在前（`pinnedAt` 倒序，
+相同时 `updatedAt` 倒序、`convId` 升序），其余 `updatedAt` 倒序，同时间按 `convId`（和 Go 参考实现一致）。其他设备改的设置由 `convSettingsChanged` 覆盖本地。
 删除：`minSeq = clearedSeq + 1`、已读推进到 `clearedSeq`、不再置顶、保留免打扰；`seq < minSeq` 的消息从内存清除（文件经 `filesExpired`），
 迟到的应答不写回；本端删除时这个会话没发出的附件取消上传、排队和失败的消息丢弃。之后有新消息会话重新出现，未读只算新消息。
 `convs` 的 `deleted` 里的群不是"你已不在该群"（没有 `convRemoved`、没有快照）；`truncated` 或 `deletedTruncated` 时不推断。
+服务端的 `minSeq` 比本地下限小（重新入群，`historyVisible=true`）时放低下限，之前清除范围里的旧历史可以重新加载。
 `features.convSettings` 关闭时只隐藏入口，SDK 照常应用已有的设置。
 
 ## 删除失败的消息（PRD-ui G-UI-14）
