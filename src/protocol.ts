@@ -135,6 +135,18 @@ export interface ServerConversation {
   mentionUnread?: number;
   /** 未读里第一条提及我的 seq；mentionUnread=0 时没有。 */
   firstMentionSeq?: number;
+  /** 置顶（PRD-chat F-CVS-01，C5）：没有置顶时不带；老服务端没有，按 false。 */
+  pinned?: boolean;
+  /** 置顶时间，只在 pinned=true 时有；置顶的会话按它倒序排在最前（F-CVS-01 规则 3）。 */
+  pinnedAt?: number;
+  /** 免打扰（F-CVS-02，C5）：不推送、未读照常计算。没有免打扰时不带；老服务端没有，按 false。不叫 muted（那是禁言）。 */
+  notifyOff?: boolean;
+}
+
+/** convs 的 deleted 一项（F-CVS-03 规则 6，C5）：被我删除且之后没有新消息的会话。 */
+export interface DeletedConv {
+  convId: string;
+  clearedSeq: number;
 }
 
 export interface SendAck {
@@ -152,6 +164,20 @@ export interface SyncAck {
 export interface ConvsAck {
   convs: ServerConversation[];
   truncated: boolean;
+  /** 当前被我删除、没有新消息的会话（C5）：消失的群先查它，在里面的不是"你已不在该群"。老服务端没有。 */
+  deleted?: DeletedConv[];
+  /** deleted 超过上限被截断（C5）：这时和 truncated 一样不推断"你已不在该群"（frontend-chat 第 54 条）。 */
+  deletedTruncated?: boolean;
+}
+
+/** convSet 的 ack（C5）：完整的新会话。 */
+export interface ConvSetAck {
+  conv: ServerConversation;
+}
+
+/** convDelete 的 ack（C5）：min(upToSeq, maxSeq)，不小于原有值。 */
+export interface ConvDeleteAck {
+  clearedSeq: number;
 }
 
 export interface AuthAck {
@@ -174,7 +200,11 @@ export type ServerEvent =
   | { type: 'readUpdated'; convId: string; readSeq: number }
   | { type: 'groupChanged'; groupId: string }
   | { type: 'socialChanged'; ver: number }
-  | { type: 'socialSettingsChanged'; mode: 'open' | 'friends'; strangerMsgLimit: number };
+  | { type: 'socialSettingsChanged'; mode: 'open' | 'friends'; strangerMsgLimit: number }
+  /** 同一用户的另一条连接改了置顶、免打扰（F-CVS-04 规则 1，C5）。pinnedAt 只在 pinned=true 时有。 */
+  | { type: 'convSettingsChanged'; convId: string; pinned: boolean; pinnedAt?: number; notifyOff: boolean }
+  /** 同一用户的另一条连接删除了会话（C5）：已读到 clearedSeq、不再置顶、minSeq = clearedSeq + 1。 */
+  | { type: 'convDeleted'; convId: string; clearedSeq: number };
 
 /** 下行帧。 */
 export interface InboundFrame {

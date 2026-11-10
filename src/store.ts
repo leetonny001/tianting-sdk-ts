@@ -1,5 +1,6 @@
 import type {
   ConvType,
+  DeletedConv,
   GroupRole,
   LastMsg,
   MsgBody,
@@ -72,6 +73,19 @@ export interface Conversation {
   mentionUnread?: number;
   /** 未读里第一条提及我的 seq（"有人@我"跳转按钮）。 */
   firstMentionSeq?: number;
+  /** 置顶（F-CVS-01，C5）：没有或 false 都是不置顶。 */
+  pinned?: boolean;
+  /** 置顶时间（pinned=true 时才有）。本端刚置顶、还没收到 ack 时是本地估算的服务端时间。 */
+  pinnedAt?: number;
+  /** 免打扰（F-CVS-02）：列表未读显示小红点、不计入总未读（@ 我的计入）。没有或 false 都是没开。 */
+  notifyOff?: boolean;
+}
+
+/** 会话设置里能改的字段（convSet、convSettingsChanged）。 */
+export interface ConvSettings {
+  pinned: boolean;
+  pinnedAt?: number;
+  notifyOff: boolean;
 }
 
 /**
@@ -191,6 +205,8 @@ class MessageList {
   private removedClient = new Map<string, string>();
   /** 已加载的最早 seq（用于向前翻页）；0 表示还没加载过。 */
   oldestSeq = 0;
+  /** 本地可见的最小 seq（会话的 minSeq，F-CVS-03 规则 2、6）：更小的消息已物理清除，迟到的 sync、ack 也不再写进来。 */
+  private floor = 1;
   /** 向前翻页是否还有更早的消息。 */
   hasMoreHistory = true;
 
@@ -202,6 +218,7 @@ class MessageList {
    */
   addServer(m: ServerMessage): Message | null {
     if (this.removedClient.get(m.clientMsgId) === m.from) return null;
+    if (m.seq < this.floor) return null;
     const deleted = m.deleted === true || this.isDeleted(m.msgId, m.seq);
     const recall = recallOf(m) ?? this.recallOf(m.msgId, m.seq);
     if (this.byMsgId.has(m.msgId)) {
@@ -290,6 +307,44 @@ class MessageList {
       else this.update(m.clientMsgId, { body });
       changed = true;
     }
+    return changed;
+  }
+
+  /**
+   * 物理清除 seq < minSeq 的消息（F-CVS-03 规则 6 ②）：正文、文件（通过 newlyExpired 让页面丢掉缓存）一起去掉，
+   * 之后到的 sync 结果、发送 ack 也不再写进来。还没发出的本地消息里引用了被清除消息的，清除引用原文（state=deleted）；
+   * 已发出的、seq ≥ minSeq 的消息（删除之后的新消息）的引用由服务端组装，照常显示（P-46 ④）。返回是否有变化。
+   */
+  purgeBelow(minSeq: number): boolean {
+    if (minSeq <= this.floor) return false;
+    this.floor = minSeq;
+    let changed = false;
+    const gone = new Set<string>();
+    for (const [seq, m] of [...this.bySeq]) {
+      if (seq >= minSeq) continue;
+      this.noteExpired(m.body);
+      this.bySeq.delete(seq);
+      if (this.byClient.get(m.clientMsgId) === m) this.byClient.delete(m.clientMsgId);
+      if (m.msgId) {
+        this.byMsgId.delete(m.msgId);
+        this.expiredIds.delete(m.msgId);
+        gone.add(m.msgId);
+      }
+      changed = true;
+    }
+    for (const id of [...this.deletedIds.keys()]) if (gone.has(id)) this.deletedIds.delete(id);
+    for (const s of [...this.deletedSeqs.keys()]) if (s < minSeq) this.deletedSeqs.delete(s);
+    for (const m of [...this.unsent]) {
+      const q = m.body.quote;
+      if (!q || q.state !== 'normal') continue;
+      if (!gone.has(q.msgId) && !(q.seq !== undefined && q.seq < minSeq)) continue;
+      this.update(m.clientMsgId, { body: { ...m.body, quote: clearedQuote(q, 'deleted') } });
+      changed = true;
+    }
+    let oldest = 0;
+    for (const s of this.bySeq.keys()) if (oldest === 0 || s < oldest) oldest = s;
+    this.oldestSeq = oldest;
+    if (oldest === 0 || oldest <= minSeq) this.hasMoreHistory = oldest === 0;
     return changed;
   }
 
@@ -414,14 +469,29 @@ export class Store {
   /**
    * 用服务端的会话列表覆盖本地（convs 的结果）。返回推断为"被移出"的群：原来在、新列表里没有的群会话
    * （服务端不为离线期间的移出补发 convRemoved，G-UI-21 ②）。列表被截断时不推断，单聊不推断。
+   * deleted（C5，F-CVS-03 规则 6 ①）里的会话是被我删除的：从列表移除，不生成快照、不算被移出（AC-CVS-03-5）；
+   * deletedTruncated 时 deleted 不全，和 truncated 一样不推断（frontend-chat 第 54 条）。
+   * 物理清除由调用方按 purgeConversation 做（列表里的按 minSeq，deleted 里的按 clearedSeq + 1）。
    */
-  setConversations(list: ServerConversation[], truncated = false): string[] {
+  setConversations(
+    list: ServerConversation[],
+    truncated = false,
+    deleted: readonly DeletedConv[] = [],
+    deletedTruncated = false,
+  ): string[] {
     const next = new Map<string, ConvState>();
     for (const c of list) next.set(c.convId, this.fromServer(c));
+    const hidden = new Map<string, HiddenConv>();
+    if (deletedTruncated) for (const [id, h] of this.hidden) if (!next.has(id)) hidden.set(id, h);
+    for (const d of deleted) {
+      if (next.has(d.convId)) continue;
+      const old = this.convs.get(d.convId) ?? this.hidden.get(d.convId)?.conv;
+      hidden.set(d.convId, { clearedSeq: d.clearedSeq, conv: old && clearedState(old, d.clearedSeq) });
+    }
     const gone: string[] = [];
-    if (!truncated) {
+    if (!truncated && !deletedTruncated) {
       for (const [id, c] of this.convs) {
-        if (c.type === 'group' && !next.has(id) && !this.placeholders.has(id)) {
+        if (c.type === 'group' && !next.has(id) && !hidden.has(id) && !this.placeholders.has(id)) {
           this.snapshots.set(id, { convId: id, type: c.type, name: c.name, removed: true });
           gone.push(id);
         }
@@ -429,9 +499,85 @@ export class Store {
     }
     for (const id of next.keys()) this.snapshots.delete(id);
     this.convs = next;
+    this.hidden = hidden;
     this.placeholders.clear();
     this.truncated = truncated;
     return gone;
+  }
+
+  /** 被我删除、还没有新消息的会话（F-CVS-03 规则 2）：有新消息时用它恢复（minSeq、已读位置、免打扰、名称）。 */
+  private hidden = new Map<string, HiddenConv>();
+
+  /**
+   * 物理清除这个会话 seq < minSeq 的本地消息（F-CVS-03 规则 6 ②，sdk-ts 只有内存，D4）。没加载过的会话不建列表。
+   * 返回消息是否有变化（有变化时调用方发 messages，文件经 takeExpiredFiles 发 filesExpired）。
+   */
+  purgeConversation(convId: string, minSeq: number): boolean {
+    return this.msgs.get(convId)?.purgeBelow(minSeq) ?? false;
+  }
+
+  /**
+   * 会话被删除到 clearedSeq（本端 deleteConv 的 ack，或其他端的 convDeleted，frontend-chat 第 55 条）：
+   * minSeq = clearedSeq + 1、readSeq = max(readSeq, clearedSeq)、不再置顶、保留免打扰，物理清除，
+   * 本地没有更新的消息时从列表移除（不是被移出，没有快照）。返回消息是否有变化。
+   */
+  clearConversation(convId: string, clearedSeq: number): boolean {
+    this.pendingDelete.delete(convId);
+    const c = this.convs.get(convId);
+    const prev = this.hidden.get(convId);
+    const seq = Math.max(clearedSeq, prev?.clearedSeq ?? 0);
+    if (c) {
+      const next = clearedState(c, seq);
+      if (next.maxSeq > seq) this.convs.set(convId, next);
+      else {
+        this.convs.delete(convId);
+        this.hidden.set(convId, { clearedSeq: seq, conv: next });
+      }
+    } else {
+      this.hidden.set(convId, { clearedSeq: seq, conv: prev?.conv && clearedState(prev.conv, seq) });
+    }
+    this.list(convId); // 还没加载过也要记下 minSeq：之后迟到的应答不能把清除范围内的消息写进来
+    return this.purgeConversation(convId, seq + 1);
+  }
+
+  /** deleteConv 等 ack 期间先从列表里拿掉（乐观更新）；失败时 cancelDelete 恢复。 */
+  private pendingDelete = new Set<string>();
+
+  hideForDelete(convId: string): void {
+    this.pendingDelete.add(convId);
+  }
+
+  cancelDelete(convId: string): boolean {
+    return this.pendingDelete.delete(convId);
+  }
+
+  /** 改置顶、免打扰（本端乐观更新、回滚，或其他端的 convSettingsChanged）。被删除隐藏的会话也记下（backend-chat 第 85 条）。 */
+  setSettings(convId: string, s: ConvSettings): boolean {
+    const c = this.convs.get(convId) ?? this.hidden.get(convId)?.conv;
+    if (!c) return false;
+    if (sameSettings(settingsOf(c), s)) return false;
+    applySettings(c, s);
+    return true;
+  }
+
+  /** 会话当前的置顶、免打扰（含被删除隐藏的会话）。不认识的会话为 undefined。 */
+  settings(convId: string): ConvSettings | undefined {
+    const c = this.convs.get(convId) ?? this.hidden.get(convId)?.conv;
+    return c && settingsOf(c);
+  }
+
+  /**
+   * convSet 的 ack（第 13.1 节：ack 的 conv 覆盖本地）。被删除隐藏的会话只更新设置，不让它重新出现；
+   * 本地已经收到比 ack 更新的消息时只取设置，其他字段等下次 convs。
+   */
+  applyConvAck(conv: ServerConversation): void {
+    const c = this.convs.get(conv.convId);
+    const hidden = this.hidden.get(conv.convId);
+    if ((hidden && !c) || (c && c.maxSeq > conv.maxSeq)) {
+      this.setSettings(conv.convId, settingsOf(conv));
+      return;
+    }
+    this.upsertConversation(conv);
   }
 
   /** 最近一次 convs 是否被截断（超过 500 个会话，C-03）。 */
@@ -439,6 +585,7 @@ export class Store {
 
   upsertConversation(c: ServerConversation): void {
     this.convs.set(c.convId, this.fromServer(c));
+    this.hidden.delete(c.convId);
     this.placeholders.delete(c.convId);
     this.snapshots.delete(c.convId); // 重新被拉进群：清除快照（G-UI-21 ③）
   }
@@ -468,13 +615,12 @@ export class Store {
   }
 
   /**
-   * 按 updatedAt 倒序、convId 升序（与服务端一致）。
+   * 置顶的在最前（pinnedAt 倒序），其余按 updatedAt 倒序，时间相同按 convId 升序（F-CVS-01 规则 3，与服务端一致）。
+   * 等 deleteConv 的 ack 期间的会话不在里面。
    * 快照引用稳定（G-UI-19）：没有变化的会话返回同一个对象，整体没有变化时返回同一个数组，界面可以按引用比较。
    */
   conversations(): Conversation[] {
-    const sorted = [...this.convs.values()].sort(
-      (a, b) => b.updatedAt - a.updatedAt || (a.convId < b.convId ? -1 : a.convId > b.convId ? 1 : 0),
-    );
+    const sorted = [...this.convs.values()].filter((c) => !this.pendingDelete.has(c.convId)).sort(compareConvs);
     const prev = this.views;
     const views = new Map<string, Conversation>();
     let same = this.lastList !== null && this.lastList.length === sorted.length;
@@ -512,7 +658,7 @@ export class Store {
     const c = this.convs.get(convId);
     if (!c || seq <= c.readSeq) return false;
     c.readSeq = seq;
-    this.recount(c);
+    recount(c);
     return true;
   }
 
@@ -532,10 +678,6 @@ export class Store {
     c.mentionUnread += 1;
     if (!c.firstMentionSeq || seq < c.firstMentionSeq) c.firstMentionSeq = seq;
     return true;
-  }
-
-  private recount(c: ConvState): void {
-    c.unread = Math.max(0, c.maxSeq - Math.max(c.readBase, c.readSeq));
   }
 
   // ---- 消息 ----
@@ -586,7 +728,7 @@ export class Store {
       c.lastMsg = deletedLast(c.lastMsg, recall);
     }
     if (m.from === this.self()) c.readSeq = Math.max(c.readSeq, m.seq);
-    this.recount(c);
+    recount(c);
     return true;
   }
 
@@ -671,11 +813,31 @@ export class Store {
     return true;
   }
 
-  /** 第一次收到某个会话的消息、本地还没有这个会话时，先补一个临时的；重新拉取 convs 后被服务端数据覆盖。 */
+  /**
+   * 第一次收到某个会话的消息、本地还没有这个会话时，先补一个临时的；重新拉取 convs 后被服务端数据覆盖。
+   * 被我删除的会话有了新消息（seq > clearedSeq）：按删除时的状态恢复，未读只算新消息，minSeq = clearedSeq + 1
+   * （F-CVS-03 规则 3，AC-CVS-03-2）。
+   */
   private newConversation(m: ServerMessage): ConvState {
-    const [type, a = '', b = ''] = m.convId.split(':');
-    const c: ConvState = {
-      convId: m.convId,
+    const hidden = this.hidden.get(m.convId);
+    if (hidden) {
+      this.hidden.delete(m.convId);
+      const c: ConvState = hidden.conv ?? { ...this.bareConversation(m.convId), maxSeq: hidden.clearedSeq };
+      Object.assign(c, clearedState(c, hidden.clearedSeq));
+      this.convs.set(m.convId, c);
+      this.placeholders.add(m.convId);
+      return c;
+    }
+    const c = this.bareConversation(m.convId);
+    this.convs.set(m.convId, c);
+    this.placeholders.add(m.convId);
+    return c;
+  }
+
+  private bareConversation(convId: string): ConvState {
+    const [type, a = '', b = ''] = convId.split(':');
+    return {
+      convId,
       type: (type as ConvType) ?? 'c2c',
       name: type === 'c2c' ? (a === this.self() ? b : a) : a,
       maxSeq: 0,
@@ -686,10 +848,72 @@ export class Store {
       updatedAt: 0,
       readBase: 0,
     };
-    this.convs.set(m.convId, c);
-    this.placeholders.add(m.convId);
-    return c;
   }
+}
+
+interface HiddenConv {
+  clearedSeq: number;
+  /** 删除前本地的会话（已按 clearedState 更新）；只从 convs 的 deleted 知道、本地没见过的没有。 */
+  conv: ConvState | undefined;
+}
+
+function recount(c: ConvState): void {
+  c.unread = Math.max(0, c.maxSeq - Math.max(c.readBase, c.readSeq));
+}
+
+/** 删除到 clearedSeq 后的会话（frontend-chat 第 55 条）：不改原对象。 */
+function clearedState(c: ConvState, clearedSeq: number): ConvState {
+  const next: ConvState = {
+    ...c,
+    minSeq: Math.max(c.minSeq, clearedSeq + 1),
+    readSeq: Math.max(c.readSeq, clearedSeq),
+    maxSeq: Math.max(c.maxSeq, clearedSeq),
+  };
+  delete next.pinned;
+  delete next.pinnedAt;
+  // 清除范围内的提及已读掉了：全部读完时清零；还有更新的消息时只能等下次 convs 的权威计数。
+  const allRead = next.readSeq >= next.maxSeq;
+  if (allRead || (next.firstMentionSeq !== undefined && next.firstMentionSeq <= clearedSeq)) {
+    delete next.firstMentionSeq;
+    if (next.mentionUnread !== undefined && allRead) next.mentionUnread = 0;
+  }
+  recount(next);
+  return next;
+}
+
+export function sameSettings(a: ConvSettings, b: ConvSettings): boolean {
+  return a.pinned === b.pinned && a.pinnedAt === b.pinnedAt && a.notifyOff === b.notifyOff;
+}
+
+function settingsOf(c: { pinned?: boolean; pinnedAt?: number; notifyOff?: boolean }): ConvSettings {
+  const s: ConvSettings = { pinned: c.pinned === true, notifyOff: c.notifyOff === true };
+  if (c.pinned === true && c.pinnedAt !== undefined) s.pinnedAt = c.pinnedAt;
+  return s;
+}
+
+/** 写进会话：false 的字段不带（和服务端的下发一致：没有置顶、免打扰时不带这些字段）。 */
+function applySettings(c: ConvState, s: ConvSettings): void {
+  if (s.pinned) {
+    c.pinned = true;
+    if (s.pinnedAt !== undefined) c.pinnedAt = s.pinnedAt;
+    else delete c.pinnedAt;
+  } else {
+    delete c.pinned;
+    delete c.pinnedAt;
+  }
+  if (s.notifyOff) c.notifyOff = true;
+  else delete c.notifyOff;
+}
+
+const byConvId = (a: Conversation, b: Conversation) => (a.convId < b.convId ? -1 : a.convId > b.convId ? 1 : 0);
+
+/** F-CVS-01 规则 3：置顶在前按 pinnedAt 倒序，其余 updatedAt 倒序，同时间 convId 升序。 */
+function compareConvs(a: Conversation, b: Conversation): number {
+  const pa = a.pinned === true;
+  const pb = b.pinned === true;
+  if (pa !== pb) return pa ? -1 : 1;
+  if (pa) return (b.pinnedAt ?? 0) - (a.pinnedAt ?? 0) || byConvId(a, b);
+  return b.updatedAt - a.updatedAt || byConvId(a, b);
 }
 
 function sameLast(a: LastMsg | null, b: LastMsg | null): boolean {
@@ -722,6 +946,9 @@ function sameConversation(a: Conversation, b: Conversation): boolean {
     a.myRole === b.myRole &&
     a.mentionUnread === b.mentionUnread &&
     a.firstMentionSeq === b.firstMentionSeq &&
+    a.pinned === b.pinned &&
+    a.pinnedAt === b.pinnedAt &&
+    a.notifyOff === b.notifyOff &&
     sameLast(a.lastMsg, b.lastMsg)
   );
 }

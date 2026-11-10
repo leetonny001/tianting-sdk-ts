@@ -13,7 +13,9 @@ const validator = new SchemaValidator(read('schema/frame.schema.json'));
 
 describe('TC-CHAT-90-09 frames.json 按 frame.schema.json 校验', () => {
   // C4 的新帧（recall、quote、mentions、msgDeleted.recalled、mentionUnread、groupMembers 的 keyword）是 TC-CHAT-90-32。
-  const tc = (name: string) => (name.includes('（C4') ? 'TC-CHAT-90-32 ' : '');
+  // C5 的新帧（convSet、convDelete、convSettingsChanged、convDeleted、pinned、notifyOff、deleted）是 TC-CHAT-90-38。
+  const tc = (name: string) =>
+    name.includes('（C4') ? 'TC-CHAT-90-32 ' : name.includes('（C5') ? 'TC-CHAT-90-38 ' : '';
   for (const v of frames.valid) {
     it(`${tc(v.name)}合法：${v.name}`, () => {
       expect(validator.errors(v.frame)).toEqual([]);
@@ -78,5 +80,27 @@ describe('TC-CHAT-90-09 frames.json 按 frame.schema.json 校验', () => {
     expect(cmds).toEqual(expect.arrayContaining(['recall', 'send', 'groupMembers']));
     for (const f of c.frames()) expect(validator.errors(f), f.cmd).toEqual([]);
     expect(c.last('groupMembers').data).toEqual({ groupId: 'g1', keyword: 'zh' });
+  });
+
+  it('TC-CHAT-90-38 SDK 发出的 C5 帧符合 Schema：convSet（pinned、notifyOff）、convDelete（upToSeq，空会话为 0）', async () => {
+    const h = setup();
+    h.im.connect('token-value');
+    const g = 'group:g1';
+    const c = await h.login('alice', [conv({ convId: g, maxSeq: 3, myRole: 'owner' })]);
+    void h.im.setConvPinned(g, true).catch(() => undefined);
+    void h.im.setConvPinned(g, false).catch(() => undefined);
+    void h.im.setConvNotifyOff('c2c:alice:bob', true).catch(() => undefined);
+    void h.im.deleteConv(g).catch(() => undefined);
+    void h.im.deleteConv('group:empty').catch(() => undefined);
+    await flush();
+    const sent = c.frames().filter((f) => f.cmd === 'convSet' || f.cmd === 'convDelete');
+    expect(sent.map((f) => f.data)).toEqual([
+      { convId: g, pinned: true },
+      { convId: g, pinned: false },
+      { convId: 'c2c:alice:bob', notifyOff: true },
+      { convId: g, upToSeq: 3 },
+      { convId: 'group:empty', upToSeq: 0 },
+    ]);
+    for (const f of c.frames()) expect(validator.errors(f), f.cmd).toEqual([]);
   });
 });

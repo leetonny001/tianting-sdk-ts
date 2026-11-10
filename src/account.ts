@@ -86,7 +86,11 @@ export interface AccountConfig {
   registerMode: 'closed' | 'invite' | 'open';
   demoLogin: boolean;
   /** msgActions：撤回、引用、@（C4，服务端 IM_MSG_ACTIONS_ENABLED）；老服务端没有这个字段，按关闭处理（PRD-ui F-UI-09 规则 4）。 */
-  features: { files: boolean; msgActions?: boolean };
+  /**
+   * convSettings：会话置顶、免打扰、删除（C5，服务端 IM_CONV_SETTINGS_ENABLED）；老服务端没有，按关闭处理。
+   * 关闭时只隐藏入口（新命令服务端回 4030），已有的置顶、免打扰、删除照常生效（P-46 ②），SDK 不按它过滤。
+   */
+  features: { files: boolean; msgActions?: boolean; convSettings?: boolean };
   limits: {
     usernameMinLen: number;
     usernameMaxLen: number;

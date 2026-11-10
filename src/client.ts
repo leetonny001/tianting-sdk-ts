@@ -29,6 +29,8 @@ import {
   parseConvId,
   parseConvIdStrict,
   type AuthAck,
+  type ConvDeleteAck,
+  type ConvSetAck,
   type ConvsAck,
   type GroupRole,
   type InboundFrame,
@@ -63,7 +65,9 @@ import {
 } from './social.js';
 import { quoteSummary, recallNoticeOf, recallText, type RecallNotice } from './recall.js';
 import {
+  sameSettings,
   Store,
+  type ConvSettings,
   type Conversation,
   type ConversationSnapshot,
   type Message,
@@ -189,8 +193,13 @@ type ClientEvents = {
   conversations: [Conversation[]];
   /** 某个会话的消息有变化。 */
   messages: [convId: string, messages: Message[]];
-  /** 全部会话的未读总数有变化（与 conversations 同一轮发出，PRD-ui G-UI-15）。 */
+  /** 总未读有变化（与 conversations 同一轮发出，PRD-ui G-UI-15）：口径同 totalUnread()。 */
   totalUnread: [number];
+  /**
+   * 会话被删除（本端 deleteConv 成功，或同一账号的其他设备删除了它，F-CVS-04 规则 1）：本地消息已清除，
+   * 页面清除这个会话的草稿（F-CVS-03 规则 7，草稿按会话清，不只是操作的那台，frontend-chat 第 55 条）。
+   */
+  convDeleted: [convId: string];
   /** 发送中 / 排队 / 失败的消息总数有变化（退出登录确认、离开页面提示用，G-UI-20）。 */
   pendingCount: [number];
   /**
@@ -517,6 +526,89 @@ export class IMClient extends Emitter<ClientEvents> {
     await this.conn.request('recall', { convId, msgId });
     const seq = this.store.list(convId).findByMsgId(msgId)?.seq;
     this.applyDeleted(convId, [msgId], seq !== undefined ? [seq] : [], { by: this.self, at: this.serverNow() });
+  }
+
+  /**
+   * 置顶 / 取消置顶（PRD-chat F-CVS-01，第 13.1 节）。乐观更新：本地先改（置顶时间先用校正后的服务端时间），
+   * ack 的 conv 覆盖本地；失败（5000、4220 置顶已满、4290、4030 开关关闭或没有权限、超时、未连接）回滚并抛出，
+   * 不自动重试（frontend-chat 第 56 条）。
+   */
+  async setConvPinned(convId: string, pinned: boolean): Promise<void> {
+    await this.changeSettings(convId, { pinned }, (s) =>
+      pinned
+        ? { ...s, pinned: true, pinnedAt: s.pinned ? s.pinnedAt : this.serverNow() }
+        : { notifyOff: s.notifyOff, pinned: false },
+    );
+  }
+
+  /** 免打扰 / 取消免打扰（F-CVS-02）。乐观更新和失败处理同 setConvPinned。 */
+  async setConvNotifyOff(convId: string, on: boolean): Promise<void> {
+    await this.changeSettings(convId, { notifyOff: on }, (s) => ({ ...s, notifyOff: on }));
+  }
+
+  private async changeSettings(
+    convId: string,
+    data: { pinned?: boolean; notifyOff?: boolean },
+    next: (s: ConvSettings) => ConvSettings,
+  ): Promise<void> {
+    if (!this.self) throw new NotConnectedError();
+    const before = this.store.settings(convId);
+    const optimistic = before && next(before);
+    if (optimistic && this.store.setSettings(convId, optimistic)) this.emitConversations();
+    let ack: ConvSetAck;
+    try {
+      ack = await this.conn.request<ConvSetAck>('convSet', { convId, ...data });
+    } catch (err) {
+      // 回滚只在本地还是这次乐观的值时做：等待期间其他端的 convSettingsChanged 已经改过的不覆盖。
+      const now = this.store.settings(convId);
+      if (before && optimistic && now && sameSettings(now, optimistic) && this.store.setSettings(convId, before)) {
+        this.emitConversations();
+      }
+      throw err;
+    }
+    this.store.applyConvAck(ack.conv);
+    this.setGroupMute(ack.conv.convId, ack.conv.mutedUntil, ack.conv.allMuted);
+    this.mutesChanged();
+    this.emitConversations();
+  }
+
+  /**
+   * 删除会话（F-CVS-03）：upToSeq 是本地看到的最大 seq。乐观更新：会话先从列表消失；成功后按 clearedSeq 物理清除本地消息
+   * 和文件缓存（filesExpired），这个会话还没发出的附件取消上传（DELETE 临时对象）、排队和失败的消息丢弃（frontend-chat 第 59 条），
+   * 然后发 convDeleted 让页面清草稿。失败时会话恢复、抛出，不自动重试（第 56 条）。确认框由页面弹。
+   */
+  async deleteConv(convId: string): Promise<void> {
+    if (!this.self) throw new NotConnectedError();
+    const upToSeq = Math.max(this.store.maxSeq(convId), this.store.conversation(convId)?.maxSeq ?? 0);
+    this.store.hideForDelete(convId);
+    this.emitConversations();
+    let ack: ConvDeleteAck;
+    try {
+      ack = await this.conn.request<ConvDeleteAck>('convDelete', { convId, upToSeq });
+    } catch (err) {
+      if (this.store.cancelDelete(convId)) this.emitConversations();
+      throw err;
+    }
+    this.discardUnsent(convId);
+    this.onConvCleared(convId, ack.clearedSeq);
+  }
+
+  /** 丢掉这个会话还没发出的消息：附件按 cancelUpload（已申请的发 DELETE），文本的排队、失败消息直接移除。发送中的不动。 */
+  private discardUnsent(convId: string): void {
+    const list = this.store.list(convId);
+    for (const m of this.store.messages(convId)) {
+      if (m.seq !== undefined) continue;
+      if (m.type === 'image' || m.type === 'file') this.cancelUpload(convId, m.clientMsgId);
+      else if (list.removeUnsent(m.clientMsgId, ['queued', 'failed'])) this.sources.delete(m.clientMsgId);
+    }
+  }
+
+  /** 本端删除成功或收到其他端的 convDeleted：清除、移除，通知页面清草稿（AC-CVS-04-5）。 */
+  private onConvCleared(convId: string, clearedSeq: number): void {
+    this.store.clearConversation(convId, clearedSeq);
+    this.emitMessages(convId);
+    this.emitConversations();
+    this.emit('convDeleted', convId);
   }
 
   /**
@@ -1134,6 +1226,16 @@ export class IMClient extends Emitter<ClientEvents> {
         this.social.settings = { ...this.social.settings, mode: ev.mode, strangerMsgLimit: ev.strangerMsgLimit };
         this.emitSocial();
         return;
+      case 'convSettingsChanged': {
+        // 其他端改的：以事件为准覆盖本地（AC-CVS-04-1）。本地不认识的会话等下次 convs。
+        const s: ConvSettings = { pinned: ev.pinned === true, notifyOff: ev.notifyOff === true };
+        if (s.pinned && typeof ev.pinnedAt === 'number') s.pinnedAt = ev.pinnedAt;
+        if (this.store.setSettings(ev.convId, s)) this.emitConversations();
+        return;
+      }
+      case 'convDeleted':
+        if (typeof ev.clearedSeq === 'number') this.onConvCleared(ev.convId, ev.clearedSeq);
+        return;
       // 不认识的事件类型忽略（协议 README 第 3 节规则 9）。
     }
   }
@@ -1300,7 +1402,11 @@ export class IMClient extends Emitter<ClientEvents> {
 
   /** 用 convs 的结果覆盖会话列表；原来在、新列表没有的群视为被移出（截断时不推断）。 */
   private applyConvs(ack: ConvsAck): void {
-    const gone = this.store.setConversations(ack.convs, ack.truncated);
+    const deleted = ack.deleted ?? [];
+    const gone = this.store.setConversations(ack.convs, ack.truncated, deleted, ack.deletedTruncated === true);
+    // 物理清除 seq < minSeq 的本地消息（F-CVS-03 规则 6 ②）：deleted 里的按 clearedSeq + 1，列表里的按 minSeq。
+    for (const d of deleted) if (this.store.purgeConversation(d.convId, d.clearedSeq + 1)) this.emitMessages(d.convId);
+    for (const c of ack.convs) if (this.store.purgeConversation(c.convId, c.minSeq)) this.emitMessages(c.convId);
     this.lastRefreshAt = this.clock.now();
     for (const c of ack.convs) {
       // 还没加载过消息的会话：之后加载到的就是这个版本以后的内容，记下作为基线。已加载的等重拉成功再更新。
@@ -1547,9 +1653,14 @@ export class IMClient extends Emitter<ClientEvents> {
 
   // ---- 其他 ----
 
-  /** 全部会话的未读之和。 */
+  /**
+   * 总未读（F-CVS-02 规则 4）：普通会话的 unread 之和 + 免打扰会话的 mentionUnread 之和（@ 我计入）。
+   * 标签角标、document.title 用它（AC-CVS-02-2、02-5）。
+   */
   totalUnread(): number {
-    return this.store.conversations().reduce((n, c) => n + c.unread, 0);
+    return this.store
+      .conversations()
+      .reduce((n, c) => n + (c.notifyOff === true ? (c.mentionUnread ?? 0) : c.unread), 0);
   }
 
   /** 状态为 queued / sending / failed 的消息条数（跨会话）。 */

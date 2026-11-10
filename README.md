@@ -134,6 +134,23 @@ messageFor('recall', 4097, { windowSeconds });  // "发送时间超过 2 分钟�
 有提及时收到 `readUpdated`、`msgDeleted` 重新拉 `convs`，5 秒内最多一次。4040（`errorReason: 'quoteUnavailable'`）、4293、4131 标记失败，不自动重发。
 引用文字、@ 的内容不进日志。
 
+## 置顶、免打扰、删除会话（PRD-chat C5）
+
+```ts
+await im.setConvPinned(convId, true);           // 乐观更新：先移到最前；ack 的 conv 覆盖本地；失败回滚并抛 IMError，不自动重试
+await im.setConvNotifyOff(convId, true);        // 同上（4220 置顶已满、4290、4030、5000、超时都回滚）
+await im.deleteConv(convId);                    // upToSeq = 本地看到的最大 seq；先从列表消失，失败恢复；页面先弹确认框
+im.totalUnread();                               // 普通会话的 unread 之和 + 免打扰会话的 mentionUnread 之和
+im.on('convDeleted', (convId) => …);            // 本端删除成功或其他设备删除了它：页面清这个会话的草稿
+```
+
+`Conversation` 增加 `pinned`、`pinnedAt`、`notifyOff`（没有时不带，按 false）；`conversations()` 置顶的在前（`pinnedAt` 倒序），
+其余 `updatedAt` 倒序，同时间按 `convId`。其他设备改的设置由 `convSettingsChanged` 覆盖本地。
+删除：`minSeq = clearedSeq + 1`、已读推进到 `clearedSeq`、不再置顶、保留免打扰；`seq < minSeq` 的消息从内存清除（文件经 `filesExpired`），
+迟到的应答不写回；本端删除时这个会话没发出的附件取消上传、排队和失败的消息丢弃。之后有新消息会话重新出现，未读只算新消息。
+`convs` 的 `deleted` 里的群不是"你已不在该群"（没有 `convRemoved`、没有快照）；`truncated` 或 `deletedTruncated` 时不推断。
+`features.convSettings` 关闭时只隐藏入口，SDK 照常应用已有的设置。
+
 ## 删除失败的消息（PRD-ui G-UI-14）
 
 ```ts
