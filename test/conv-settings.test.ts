@@ -367,6 +367,118 @@ describe('F-CVS-03 删除会话', () => {
     expect(JSON.stringify(h.im.debugExport())).not.toContain('ZXQ-CVS-3');
   });
 
+  it('第 68 条：发送中的消息 ack 晚到、seq 落在清除范围里（upToSeq 之前已经看到别人更新的消息）：这条一起去掉，不停在"发送中"', async () => {
+    const [h, c] = await online([sc({ convId: AB, maxSeq: 5, readSeq: 5, updatedAt: 5 })]);
+    await loaded(h, c, AB, [m(AB, 5)]);
+    const r = h.im.send(AB, 'ZXQ-CVS-10 发送中');
+    expect(r.ok && r.message.status).toBe('sending');
+    const sendId = c.last('send').id;
+    down(c, { cmd: 'msg', data: m(AB, 7) }); // 服务端给我的这条排了 6，别人的 7 先到
+    await flush();
+    const p = h.im.deleteConv(AB);
+    expect(c.last('convDelete').data).toEqual({ convId: AB, upToSeq: 7 });
+    ack(c, 'convDelete', { clearedSeq: 7 });
+    await p;
+    expect(h.im.messages(AB).map((x) => x.status)).toEqual(['sending']); // 发送中的不动（第 59 条）
+    const seen: number[] = [];
+    h.im.on('messages', (id, list) => id === AB && seen.push(list.length));
+    c.receive({ id: sendId, cmd: 'ack', data: { msgId: idOf(AB, 6), convId: AB, seq: 6, ts: 1006 } });
+    await flush();
+    expect(h.im.messages(AB)).toEqual([]);
+    expect(seen.at(-1)).toBe(0);
+    expect(h.im.pendingCount()).toBe(0);
+    expect(ids(h)).toEqual([]);
+    expect(JSON.stringify(h.im.debugExport())).not.toContain('ZXQ-CVS-10');
+    // 之后的 sync 再带着它也不回来。
+    down(c, { cmd: 'msg', data: m(AB, 8) });
+    await flush();
+    void h.im.loadHistory(AB);
+    await flush();
+    expect(h.im.messages(AB).map((x) => x.seq)).toEqual([8]);
+  });
+
+  it('第 68 条：超时标记失败后 ack 才到、seq 落在其他设备删除的清除范围里：同样去掉', async () => {
+    const [h, c] = await online([sc({ convId: AB, maxSeq: 5, readSeq: 5, updatedAt: 5 })]);
+    const r = h.im.send(AB, 'ZXQ-CVS-11');
+    const sendId = c.last('send').id;
+    h.clock.advance(11_000);
+    await flush();
+    expect(r.ok && h.im.messages(AB)[0]!.status).toBe('failed');
+    event(c, { type: 'convDeleted', convId: AB, clearedSeq: 7 }); // 其他设备删除时本机未发出的保留（第 63 条）
+    expect(h.im.messages(AB).map((x) => x.status)).toEqual(['failed']);
+    c.receive({ id: sendId, cmd: 'ack', data: { msgId: idOf(AB, 6), convId: AB, seq: 6, ts: 1006 } });
+    await flush();
+    expect(h.im.messages(AB)).toEqual([]);
+    expect(h.im.pendingCount()).toBe(0);
+  });
+
+  it('第 68 条：图片发送中、ack 落在清除范围里：消息去掉，fileId 经 filesExpired 让页面丢掉缓存', async () => {
+    const h = accountSetup();
+    const ab = `c2c:${USER}:bob`;
+    h.session(1, 24 * HOUR);
+    const c = await h.online();
+    const expired: string[][] = [];
+    h.im.on('filesExpired', (f) => expired.push(f));
+    h.im.sendImage(ab, {
+      original: { data: new Uint8Array(1000), mime: 'image/jpeg' },
+      thumb: { data: new Uint8Array(100), mime: 'image/jpeg' },
+      width: 10,
+      height: 10,
+    });
+    await flush();
+    const put = (k: string) => ({ url: `https://s3.test/${k}?X-Amz-Signature=1`, headers: {}, expiresAt: 1 });
+    h.http
+      .to('/v1/files/uploads')
+      .at(-1)!
+      .respond(200, { fileId: 'F7', put: put('o'), thumbPut: put('t') });
+    await flush();
+    h.upload.pending[0]!.respond(200);
+    await flush();
+    h.upload.pending[0]!.respond(200);
+    await flush();
+    h.http.last('/v1/files/F7/complete').respond(200, {
+      fileId: 'F7',
+      size: 1000,
+      mime: 'image/jpeg',
+      width: 10,
+      height: 10,
+      thumbSize: 100,
+    });
+    await flush();
+    expect(h.im.messages(ab).map((x) => x.status)).toEqual(['sending']);
+    const sendId = c.last('send').id;
+    c.receive({ cmd: 'event', data: { type: 'convDeleted', convId: ab, clearedSeq: 7 } });
+    c.receive({ id: sendId, cmd: 'ack', data: { msgId: 'm6', convId: ab, seq: 6, ts: 1006 } });
+    await flush();
+    expect(h.im.messages(ab)).toEqual([]);
+    expect(expired.flat()).toContain('F7');
+  });
+
+  it('第 68 条：迟到的 sync 里别人的消息恰好用了同一个 clientMsgId（只在同一发送者内唯一）：不去掉我的', async () => {
+    const [h, c] = await online([sc({ convId: AB, maxSeq: 5, readSeq: 5, updatedAt: 5 })]);
+    void h.im.loadHistory(AB); // 应答迟到
+    await flush();
+    const syncId = c.last('sync').id;
+    const r = h.im.send(AB, '我的');
+    if (!r.ok) throw new Error('send');
+    event(c, { type: 'convDeleted', convId: AB, clearedSeq: 7 });
+    const theirs = { ...m(AB, 4), clientMsgId: r.message.clientMsgId };
+    c.receive({ id: syncId, cmd: 'ack', data: { messages: [theirs], hasMore: false } });
+    await flush();
+    expect(h.im.messages(AB).map((x) => [x.clientMsgId, x.status])).toEqual([[r.message.clientMsgId, 'sending']]);
+  });
+
+  it('第 68 条对照：ack 的 seq 在清除范围之后：照常变成已发送，会话重新出现', async () => {
+    const [h, c] = await online([sc({ convId: AB, maxSeq: 5, readSeq: 5, updatedAt: 5 })]);
+    h.im.send(AB, '之后的');
+    const sendId = c.last('send').id;
+    event(c, { type: 'convDeleted', convId: AB, clearedSeq: 5 });
+    c.receive({ id: sendId, cmd: 'ack', data: { msgId: idOf(AB, 6), convId: AB, seq: 6, ts: 1006 } });
+    await flush();
+    expect(h.im.messages(AB).map((x) => [x.seq, x.status])).toEqual([[6, 'sent']]);
+    expect(find(h, AB)).toMatchObject({ minSeq: 6, unread: 0 });
+  });
+
   it('第 59 条、AC-CVS-03-8（SDK 部分）：确认删除时取消这个会话正在上传的附件（DELETE 临时对象）、丢弃排队和失败的消息；别的会话不动', async () => {
     const h = accountSetup();
     const ab = `c2c:${USER}:bob`;

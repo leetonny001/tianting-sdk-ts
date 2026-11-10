@@ -218,7 +218,12 @@ class MessageList {
    */
   addServer(m: ServerMessage): Message | null {
     if (this.removedClient.get(m.clientMsgId) === m.from) return null;
-    if (m.seq < this.floor) return null;
+    if (m.seq < this.floor) {
+      // 清除范围内的：不写进来。本机待发的那条（ack 晚到，seq 落在清除范围里：upToSeq 之前已经看到了别人更新的消息）
+      // 一起去掉，不能一直停在"发送中"（frontend-chat 第 68 条，同 sdk-swift）。
+      this.dropUnsentBelow(m);
+      return null;
+    }
     const deleted = m.deleted === true || this.isDeleted(m.msgId, m.seq);
     const recall = recallOf(m) ?? this.recallOf(m.msgId, m.seq);
     if (this.byMsgId.has(m.msgId)) {
@@ -260,6 +265,18 @@ class MessageList {
     this.byMsgId.add(m.msgId);
     if (this.oldestSeq === 0 || m.seq < this.oldestSeq) this.oldestSeq = m.seq;
     return msg;
+  }
+
+  /**
+   * 服务端说这条本机待发的消息落在清除范围里：从列表去掉（文件经 newlyExpired 清缓存）。之后的应答由下限挡住；
+   * 重新入群放低下限后它作为历史照常出现（规则 6a）。clientMsgId 只在同一发送者内唯一，别人的同名消息不算。
+   */
+  private dropUnsentBelow(m: ServerMessage): void {
+    const local = this.byClient.get(m.clientMsgId);
+    if (!local || local.seq !== undefined || local.from !== m.from) return;
+    this.unsent = this.unsent.filter((x) => x !== local);
+    this.byClient.delete(m.clientMsgId);
+    this.noteExpired(local.body);
   }
 
   isDeleted(msgId: string, seq?: number): boolean {
@@ -728,6 +745,7 @@ export class Store {
   /**
    * 合并一条服务端消息，并更新会话的 maxSeq、未读、最后一条消息。
    * 自己发的消息（来自自己的其他端）不增加未读，并推进已读（C-34）。返回是否是新消息。
+   * 本机待发的那条因为 seq 落在清除范围里被去掉时返回 false：只会来自发送 ack 和 loadHistory 的应答，这两处都会发 messages。
    */
   applyServerMessage(m: ServerMessage): boolean {
     const merged = this.list(m.convId).addServer(m);
