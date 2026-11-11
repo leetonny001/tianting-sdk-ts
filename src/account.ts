@@ -90,7 +90,11 @@ export interface AccountConfig {
    * convSettings：会话置顶、免打扰、删除（C5，服务端 IM_CONV_SETTINGS_ENABLED）；老服务端没有，按关闭处理。
    * 关闭时只隐藏入口（新命令服务端回 4030），已有的置顶、免打扰、删除照常生效（P-46 ②），SDK 不按它过滤。
    */
-  features: { files: boolean; msgActions?: boolean; convSettings?: boolean };
+  /**
+   * moderation：举报入口（C6，服务端 IM_MOD_ENABLED）；老服务端没有，按关闭处理。关闭时消息菜单、资料卡、群信息页都不显示"举报"；
+   * 只控制举报入口，4510 的提示和它无关（frontend-chat 第 76 条）。
+   */
+  features: { files: boolean; msgActions?: boolean; convSettings?: boolean; moderation?: boolean };
   limits: {
     usernameMinLen: number;
     usernameMaxLen: number;

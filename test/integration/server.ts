@@ -124,7 +124,14 @@ function build(): string {
   return built;
 }
 
-export async function startServer(env: Record<string, string> = {}): Promise<RunningServer> {
+/**
+ * extraScopes：只给这个服务端的调用方多配的 scope（C6 的 moderation.words 等）。服务端不认识的 scope 会启动失败，
+ * 所以不加进公共的 CALLER_SCOPES，免得其他集成用例跟着失败。
+ */
+export async function startServer(
+  env: Record<string, string> = {},
+  opts: { extraScopes?: string[] } = {},
+): Promise<RunningServer> {
   const bin = build();
   const port = await freePort();
   const adminPort = await freePort(); // 管理接口在单独的端口上（tianting-server PRD-admin F-KEY-01）
@@ -137,7 +144,7 @@ export async function startServer(env: Record<string, string> = {}): Promise<Run
         id: CALLER_ID,
         alg: 'hmac-sha256',
         secret: Buffer.from(CALLER_SECRET).toString('base64'),
-        scopes: CALLER_SCOPES,
+        scopes: [...CALLER_SCOPES, ...(opts.extraScopes ?? [])],
         pushTypes: CALLER_PUSH_TYPES,
       },
     ]),

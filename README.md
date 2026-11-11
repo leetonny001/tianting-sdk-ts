@@ -152,6 +152,23 @@ im.on('convDeleted', (convId) => …);            // 本端删除成功或其他
 服务端的 `minSeq` 比本地下限小（重新入群，`historyVisible=true`）时放低下限，之前清除范围里的旧历史可以重新加载。
 `features.convSettings` 关闭时只隐藏入口，SDK 照常应用已有的设置。
 
+## 举报、内容拦截（PRD-chat C6）
+
+```ts
+const reportId = await im.report({ targetType: 'message', convId, msgIds: [msgId], reason: 'abuse', note }); // 第一批页面只举报单条
+await im.report({ targetType: 'user', userId, reason: 'spam' });
+await im.report({ targetType: 'group', groupId, reason: 'illegal' });
+im.canRetry(m);                                 // 失败气泡有没有"重发"：4510（内容被拦截）和 sourceMissing 没有，只有"复制""删除"
+messageFor('send', 4510);                       // "消息包含不当内容，无法发送"；其他命令和账号接口："内容包含不当信息，请修改后重试"
+```
+
+`report` 在本地先校验：`targetType` 互斥（`message` 带 `convId`、`msgIds`；`user` 带 `userId`；`group` 带 `groupId`），`reason` 是
+`spam`、`abuse`、`porn`、`fraud`、`illegal`、`other` 之一，`msgIds` 1～20 条，`note` 不超过 200 个码点，不认识的字段也不行；
+不合法直接抛 `IMError` 4000（`details.field`），不发帧。服务端的 4292、4040 `reportTargetInvalid`、4030 `featureDisabled`、4290、5000、超时原样抛出，
+不自动重试（文案 `messageFor('report', code)`）。`note` 不进日志和错误信息。入口按 `features.moderation`（老服务端没有，按关闭）；4510 的提示和它无关。
+`send`、`sendImage`、`sendFile` 收到 4510：消息标记失败、`error = 4510`，不自动重发，`retry` 也不发（超时之后才到的 4510 同样改成 4510）；
+错误里没有命中的词。账号接口（注册、改昵称）的 4510 以 `AccountError {status: 451, code: 4510}` 原样抛出。
+
 ## 删除失败的消息（PRD-ui G-UI-14）
 
 ```ts

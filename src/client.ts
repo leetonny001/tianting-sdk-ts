@@ -24,6 +24,7 @@ import {
 import { silentLogger, type Logger } from './logger.js';
 import { MuteTable, type MuteInfo } from './mute.js';
 import { PUSH_DEFAULTS, PushSync, type Push, type PushLimits, type PushStart, type PushSyncAck } from './push.js';
+import { reportRequest, type ReportInput } from './report.js';
 import {
   groupConvId,
   parseConvId,
@@ -38,6 +39,7 @@ import {
   type Mentions,
   type Platform,
   type QuoteView,
+  type ReportAck,
   type SendAck,
   type ServerConversation,
   type ServerEvent,
@@ -475,6 +477,8 @@ export class IMClient extends Emitter<ClientEvents> {
    * 发送文本。先在本地插入一条"发送中"（离线时"排队"）的消息，ack 后更新为已发送。
    * 文本为空或超过 5000 字时不发送，返回原因。opts 可以带引用和 @（C4）：单聊带 mentions 直接抛错（服务端也会 4000）。
    * 4040（reason=quoteUnavailable）、4293（@ 所有人次数用完）、4131 和其他错误码一样标记失败，不自动重发。
+   * 4510（内容被拦截，C6）：标记失败，error=4510，不自动重发，也不能手动重发（canRetry 为 false，frontend-chat 第 81 条）；
+   * 错误里没有命中的词（服务端不给 details）。文案 messageFor('send', 4510)。
    */
   send(convId: string, raw: string, opts: SendOptions = {}): SendResult {
     const check = checkText(raw);
@@ -591,6 +595,20 @@ export class IMClient extends Emitter<ClientEvents> {
     }
     this.discardUnsent(convId);
     this.onConvCleared(convId, ack.clearedSeq);
+  }
+
+  /**
+   * 举报（PRD-chat F-MOD-03，第 13.1 节，C6）：返回 reportId。参数在本地先校验（targetType 互斥、reason 六选一、
+   * msgIds 1～20 条、note 不超过 200 个码点），不合法直接抛 IMError 4000（details.field），不发帧。
+   * 服务端的错误原样抛出，不自动重试：4292（今天的举报次数已用完）、4040 reportTargetInvalid（"无法举报该内容"）、
+   * 4030 featureDisabled（"举报功能暂不可用"）、4290、5000、超时、未连接。被举报人、举报人都不会收到帧。
+   * 入口是否显示看 GET /v1/config 的 features.moderation；第一批页面只举报单条（R-CF-21），接口保留数组。
+   * note 按正文对待：不进日志、不进错误信息。
+   */
+  async report(input: ReportInput): Promise<string> {
+    const data = reportRequest(input, this.self || null);
+    const ack = await this.conn.request<ReportAck>('report', data);
+    return ack.reportId;
   }
 
   /** 丢掉这个会话还没发出的消息：附件按 cancelUpload（已申请的发 DELETE），文本的排队、失败消息直接移除。发送中的不动。 */
@@ -956,13 +974,21 @@ export class IMClient extends Emitter<ClientEvents> {
   }
 
   /**
-   * 手动重发失败的消息，沿用原来的 clientMsgId（PRD F-MSG-03 规则 2）。
+   * 失败的消息能不能"重发"（失败气泡的按钮）。4510 被拦截的不能（原样重发一定还是 4510，frontend-chat 第 81 条），
+   * 只有"复制""删除"；sourceMissing（原文件已不可用）也不能，只能删除。其余失败的可以。
+   */
+  canRetry(m: Pick<Message, 'status' | 'error'>): boolean {
+    return m.status === 'failed' && m.error !== ErrorCode.CONTENT_BLOCKED && m.error !== 'sourceMissing';
+  }
+
+  /**
+   * 手动重发失败的消息，沿用原来的 clientMsgId（PRD F-MSG-03 规则 2）。canRetry 为 false 的（4510、sourceMissing）不动。
    * 附件（F-FILE-07 规则 4）：已经 complete 的复用同一 fileId，不重传（AC-FILE-07-2）；没上传完的从头上传（新的 fileId）；
    * 源已经不在的不动，error 改成 sourceMissing（"原文件已不可用，请重新选择"，只能删除）。
    */
   retry(convId: string, clientMsgId: string): void {
     const m = this.store.list(convId).local(clientMsgId);
-    if (!m || m.status !== 'failed') return;
+    if (!m || !this.canRetry(m)) return;
     if (this.needsUpload(m)) {
       const src = this.sources.get(clientMsgId);
       if (!src) {
@@ -1537,6 +1563,7 @@ export class IMClient extends Emitter<ClientEvents> {
           onLateAck: (data, err) => {
             if (!err) onAck(data as SendAck);
             else if (err.code === ErrorCode.MUTED) this.onMutedAck(err.details);
+            else if (err.code === ErrorCode.CONTENT_BLOCKED) this.lateBlocked(convId, clientMsgId);
           },
         },
       )
@@ -1596,6 +1623,18 @@ export class IMClient extends Emitter<ClientEvents> {
     list.update(clientMsgId, { status: 'uploading', body, error: undefined, errorReason: undefined });
     this.emitMessages(convId);
     this.enqueueUpload(convId, clientMsgId);
+  }
+
+  /**
+   * 超时标记失败之后才到的 4510：失败原因改成 4510，气泡不再提供"重发"（frontend-chat 第 81 条）。
+   * 只改仍然是超时失败的；用户已经手动重发（又在发送中）的以那次的结果为准。不再发 sendFailed（页面已经提示过失败）。
+   */
+  private lateBlocked(convId: string, clientMsgId: string): void {
+    const list = this.store.list(convId);
+    const m = list.local(clientMsgId);
+    if (!m || m.status !== 'failed' || m.error !== 'timeout') return;
+    list.update(clientMsgId, { error: ErrorCode.CONTENT_BLOCKED, errorReason: undefined });
+    this.emitMessages(convId);
   }
 
   private fail(convId: string, clientMsgId: string, error: Message['error'], reason?: string): void {

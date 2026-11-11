@@ -106,7 +106,9 @@ export {
   c2cConvId,
   groupConvId,
   parseConvIdStrict,
+  isValidId,
   peerId,
+  REPORT_REASONS,
   type ConvType,
   type FileBody,
   type GroupRole,
@@ -116,9 +118,12 @@ export {
   type QuoteState,
   type QuoteView,
   type MsgType,
+  type ReportReason,
+  type ReportTargetType,
   type TipBody,
   type Platform,
 } from './protocol.js';
 export type { Clock } from './clock.js';
 export type { Logger } from './logger.js';
 export { WebSocketTransport, type Transport, type TransportConnection, type TransportHandlers } from './transport.js';
+export { REPORT_MSG_MAX, REPORT_NOTE_MAX, type ReportInput } from './report.js';

@@ -180,6 +180,31 @@ export interface ConvDeleteAck {
   clearedSeq: number;
 }
 
+/** 举报对象（PRD-chat F-MOD-03，C6）。 */
+export type ReportTargetType = 'message' | 'user' | 'group';
+/** 举报理由（F-MOD-03 规则 1）。界面文案见 frontend-chat 第 78 条。 */
+export type ReportReason = 'spam' | 'abuse' | 'porn' | 'fraud' | 'illegal' | 'other';
+export const REPORT_REASONS: readonly ReportReason[] = ['spam', 'abuse', 'porn', 'fraud', 'illegal', 'other'];
+
+/**
+ * report 命令的 data（frame.schema.json 的 ReportReq）：按 targetType 互斥。
+ * message 带 convId（单聊或群聊）和同一会话的 msgIds；user 带 userId；group 带 groupId。
+ */
+export interface ReportReq {
+  targetType: ReportTargetType;
+  convId?: string;
+  msgIds?: string[];
+  userId?: string;
+  groupId?: string;
+  reason: ReportReason;
+  note?: string;
+}
+
+/** report 的 ack（C6）：24 小时内对同一对象重复提交返回第一次的 reportId。 */
+export interface ReportAck {
+  reportId: string;
+}
+
 export interface AuthAck {
   userId: string;
   serverTime: number;
@@ -230,6 +255,11 @@ export function groupConvId(groupId: string): string {
 }
 
 const ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+
+/** userId、groupId、msgId 的字符集（frame.schema.json 的 UserId 等）。 */
+export function isValidId(s: unknown): s is string {
+  return typeof s === 'string' && ID_RE.test(s);
+}
 
 /** 会话 ID 不合法（invalid），或者合法但自己不是参与者（notParticipant）。 */
 export class ConvIdError extends Error {

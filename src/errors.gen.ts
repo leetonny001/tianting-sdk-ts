@@ -41,6 +41,7 @@ export const ErrorCode = {
   USERNAME_TAKEN: 4095,
   FILE_NOT_READY: 4096,
   RECALL_WINDOW_EXPIRED: 4097,
+  REPORT_ALREADY_HANDLED: 4098,
   GROUP_MEMBER_LIMIT_EXCEEDED: 4130,
   BATCH_LIMIT_EXCEEDED: 4131,
   FRIEND_LIMIT_EXCEEDED: 4132,
@@ -56,6 +57,7 @@ export const ErrorCode = {
   QUOTA_EXCEEDED: 4292,
   MENTION_ALL_LIMITED: 4293,
   ACCOUNT_LOGIN_LOCKED: 4294,
+  CONTENT_BLOCKED: 4510,
   INTERNAL: 5000,
   SERVICE_UNAVAILABLE: 5030,
   OBJECT_STORE_UNAVAILABLE: 5032,
@@ -103,6 +105,7 @@ export const ERROR_INFO: Readonly<Record<number, { name: string; retryable: bool
   4095: { name: "USERNAME_TAKEN", retryable: false, message: "用户名已存在或保留" },
   4096: { name: "FILE_NOT_READY", retryable: false, message: "文件未完成上传，或已绑定其他消息" },
   4097: { name: "RECALL_WINDOW_EXPIRED", retryable: false, message: "超过撤回时限（details.windowSeconds）" },
+  4098: { name: "REPORT_ALREADY_HANDLED", retryable: false, message: "举报已被处理" },
   4130: { name: "GROUP_MEMBER_LIMIT_EXCEEDED", retryable: false, message: "群成员已达上限" },
   4131: { name: "BATCH_LIMIT_EXCEEDED", retryable: false, message: "单次批量操作数量超限" },
   4132: { name: "FRIEND_LIMIT_EXCEEDED", retryable: false, message: "好友数量已达上限" },
@@ -118,6 +121,7 @@ export const ERROR_INFO: Readonly<Record<number, { name: string; retryable: bool
   4292: { name: "QUOTA_EXCEEDED", retryable: false, message: "今天的次数已用完" },
   4293: { name: "MENTION_ALL_LIMITED", retryable: false, message: "@ 所有人次数用完（details.retryAfterSeconds）" },
   4294: { name: "ACCOUNT_LOGIN_LOCKED", retryable: false, message: "尝试过多，暂时锁定（details.retryAfterSeconds）" },
+  4510: { name: "CONTENT_BLOCKED", retryable: false, message: "内容被拦截" },
   5000: { name: "INTERNAL", retryable: true, message: "服务器内部错误" },
   5030: { name: "SERVICE_UNAVAILABLE", retryable: true, message: "服务暂不可用" },
   5032: { name: "OBJECT_STORE_UNAVAILABLE", retryable: true, message: "对象存储暂不可用（reason: completeInProgress 是同一上传的 complete 正在进行）" },
@@ -143,6 +147,7 @@ export const CLIENT_ERROR_CODES: readonly number[] = [
   4290,
   4292,
   4294,
+  4510,
   5000,
   5030,
   5032,
@@ -150,11 +155,11 @@ export const CLIENT_ERROR_CODES: readonly number[] = [
 
 /** 错误码 → 细分的 reason（PRD-chat 第 11.5 节）。收到没有列出的 reason 不能报错。 */
 export const ERROR_REASONS: Readonly<Record<number, readonly string[]>> = {
-  4000: ["passwordWeak","recoveryCodeStale","fileKindMismatch","uploadMismatch","fileNameTooLong"],
+  4000: ["passwordWeak","recoveryCodeStale","fileKindMismatch","uploadMismatch","fileNameTooLong","customDisabled"],
   4011: ["tokenSuperseded"],
   4019: ["invalid","expired","revoked","superseded","replayDetected","credentialsChanged","loggedOutOthers","accountDeleted"],
   4030: ["registerClosed","inviteInvalid","accountSessionRequired","accountExists","accountDeletionPending","featureDisabled","mentionAllForbidden"],
-  4040: ["quoteUnavailable"],
+  4040: ["quoteUnavailable","reportTargetInvalid"],
   4290: ["recoverLimited","uploadPendingLimit"],
   5032: ["completeInProgress"],
 };

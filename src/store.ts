@@ -19,7 +19,8 @@ import { countCodePoints } from './text.js';
 export type MessageStatus = 'processing' | 'uploading' | 'queued' | 'sending' | 'sent' | 'failed';
 
 /**
- * 发送失败的原因：服务端错误码（4292 上传额度用完、4290 + errorReason=uploadPendingLimit、4139、4150、4096、5032…），
+ * 发送失败的原因：服务端错误码（4292 上传额度用完、4290 + errorReason=uploadPendingLimit、4139、4150、4096、5032、
+ * 4510 内容被拦截（不能重发，见 IMClient.canRetry）…），
  * 或者 timeout（10 秒没有 ack）、kicked（被踢）、network（上传时网络或对象存储出错）、
  * process（App 处理图片失败：提示"无法处理这张图片，请用文件方式发送"）、
  * sourceMissing（要重新上传但原文件已不在：提示"原文件已不可用，请重新选择"）。
