@@ -195,7 +195,8 @@ npm run build
 `protocol/` 是服务端仓库协议文件的副本（错误码、帧 Schema、共享测试用例），不要直接改。服务端协议变更后：
 
 ```bash
-scripts/sync-protocol.sh       # 默认从同级目录 ../tianting-server 同步，并重新生成 src/errors.gen.ts
+scripts/sync-protocol.sh       # 默认取同级目录 ../tianting-server 的 HEAD（git archive，只取已提交的内容，问题 90），并重新生成 src/errors.gen.ts
+scripts/sync-protocol.sh ../im-mvp 596de46     # 指定检出目录和提交；也可以传 git archive 导出的目录 + 提交号
 ```
 
 ## 集成测试
