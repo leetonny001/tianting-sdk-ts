@@ -212,7 +212,10 @@ describe('4510 × 真实服务端（BE-493、BE-494）', () => {
   let srv: RunningServer;
   const t = harness(() => srv);
   beforeAll(async () => {
-    srv = await startServer({ ...MOD_ENV, IM_REGISTER_MODE: 'invite' }, { extraScopes: ['moderation.words'] });
+    srv = await startServer(
+      { ...MOD_ENV, IM_REGISTER_MODE: 'invite' },
+      { extraScopes: ['moderation.words', 'social.friends'] },
+    );
     await srv.signed('POST', '/admin/moderation/words', { word: WORD });
   });
   afterAll(async () => {
@@ -255,7 +258,11 @@ describe('4510 × 真实服务端（BE-493、BE-494）', () => {
   it('建群的群名含特征词：IMError 4510 原样抛出，不带 details', async () => {
     const [u1, u2, u3] = [uid('bc'), uid('bd'), uid('bf')];
     await t.users(u1, u2, u3);
+    // 建群的敏感词检查在被邀请人判定之后（F-MOD-02 规则 5、backend-chat 第 112 条，BE-499 问题 137）：被邀请人要是好友，
+    // 否则先回 4035。对照：同样的成员、正常群名可以建（排除 4035 等其他原因）。
+    await srv.signed('POST', '/admin/friends/import', { pairs: [u2, u3].map((b) => ({ a: u1, b })) });
     const a = await t.login(u1);
+    expect((await a.createGroup({ name: '正常群名', members: [u2, u3] })).groupId).toBeTruthy();
     const e = await a.createGroup({ name: `群 ${WORD}`, members: [u2, u3] }).catch((x: unknown) => x);
     expect(e).toBeInstanceOf(IMError);
     expect(e).toMatchObject({ code: 4510, details: undefined });
