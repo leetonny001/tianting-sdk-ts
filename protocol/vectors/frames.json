@@ -325,6 +325,11 @@
     {"name": "report 多余字段（C6）", "frame": {"id": "p1", "cmd": "report", "data": {"targetType": "user", "userId": "u9", "reason": "spam", "evidence": true}}},
     {"name": "report 缺 data（C6）", "frame": {"id": "p1", "cmd": "report"}},
     {"name": "report 缺 id（C6）", "frame": {"cmd": "report", "data": {"targetType": "user", "userId": "u9", "reason": "spam"}}},
+    {"name": "report 用户带空串 convId（C6）", "frame": {"id": "p1", "cmd": "report", "data": {"targetType": "user", "userId": "u9", "convId": "", "reason": "spam"}}},
+    {"name": "report 群带 null convId（C6）", "frame": {"id": "p1", "cmd": "report", "data": {"targetType": "group", "groupId": "g1", "convId": null, "reason": "spam"}}},
+    {"name": "report 用户带空串 groupId（C6）", "frame": {"id": "p1", "cmd": "report", "data": {"targetType": "user", "userId": "u9", "groupId": "", "reason": "spam"}}},
+    {"name": "report 消息带空串 userId（C6）", "frame": {"id": "p1", "cmd": "report", "data": {"targetType": "message", "convId": "group:g1", "msgIds": ["m7"], "userId": "", "reason": "abuse"}}},
+    {"name": "report note 为 null（C6）", "frame": {"id": "p1", "cmd": "report", "data": {"targetType": "user", "userId": "u9", "reason": "spam", "note": null}}},
     {"name": "ack 4510 带 details（C6）", "frame": {"id": "s1", "cmd": "ack", "error": {"code": 4510, "msg": "content blocked", "details": {"wordId": "w1"}}}},
     {"name": "ack report reportId 格式错（C6）", "frame": {"id": "p1", "cmd": "ack", "data": {"reportId": "rp 1"}}},
     {"name": "ack report reportId 不是字符串（C6）", "frame": {"id": "p1", "cmd": "ack", "data": {"reportId": 1}}}

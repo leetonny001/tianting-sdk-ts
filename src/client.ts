@@ -611,6 +611,22 @@ export class IMClient extends Emitter<ClientEvents> {
     return ack.reportId;
   }
 
+  /**
+   * 消息菜单、撤回提示行有没有"举报"（frontend-chat 第 77、88、89、92 条，三套 SDK 同一口径）：
+   * 别人发的、已经发送成功的 text、image、file；自己的、tip、custom、发送中和失败的、后台删除的都没有。
+   * 撤回提示行只在别人撤回的消息上有：自己（群主、管理员）撤回的没有；撤回者未知（recalledBy 为空）按别人撤回；
+   * 自己的消息被别人撤回也没有（消息本来是自己的）。只有本机看过的（seq ≤ 会话的 readSeq，服务端同样校验），
+   * 会话不在本地列表时没有。不看 features.moderation：开关关闭时页面不显示任何举报入口（第 76 条）。
+   */
+  canReport(m: Message): boolean {
+    const me = this.self; // 没连上过时本地没有会话列表，下面的会话检查就不通过
+    if (m.from === me || m.status !== 'sent' || !m.msgId || m.seq === undefined) return false;
+    if (m.type !== 'text' && m.type !== 'image' && m.type !== 'file') return false;
+    if (m.recalled ? m.recalledBy === me : m.deleted) return false;
+    const c = this.store.conversation(m.convId);
+    return !!c && m.seq <= c.readSeq;
+  }
+
   /** 丢掉这个会话还没发出的消息：附件按 cancelUpload（已申请的发 DELETE），文本的排队、失败消息直接移除。发送中的不动。 */
   private discardUnsent(convId: string): void {
     const list = this.store.list(convId);

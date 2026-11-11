@@ -105,9 +105,9 @@ describe('TC-CHAT-90-09 frames.json 按 frame.schema.json 校验', () => {
     for (const f of c.frames()) expect(validator.errors(f), f.cmd).toEqual([]);
   });
 
-  it('TC-CHAT-90-46 frames.json 的 C6 用例都在（13 个合法、27 个非法）', () => {
+  it('TC-CHAT-90-46 frames.json 的 C6 用例都在（13 个合法、32 个非法，含 6ef4217 的 5 个空串、null 字段）', () => {
     expect(frames.valid.filter((v) => v.name.includes('（C6'))).toHaveLength(13);
-    expect(frames.invalid.filter((v) => v.name.includes('（C6'))).toHaveLength(27);
+    expect(frames.invalid.filter((v) => v.name.includes('（C6'))).toHaveLength(32);
   });
 
   it('TC-CHAT-90-46 SDK 发出的 C6 帧符合 Schema：report 三种对象、note、20 条；frames.json 的非法 report 本地就拒绝、不发帧', async () => {

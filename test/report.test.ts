@@ -404,3 +404,99 @@ describe('features.moderation（backend-chat 第 96 条，frontend-chat 第 76 �
     }
   });
 });
+
+describe('canReport（frontend-chat 第 77、88、89、92 条，三套 SDK 同一口径）', () => {
+  const base = (p: Partial<Message>): Message => ({
+    clientMsgId: 'c1',
+    msgId: 'm1',
+    seq: 3,
+    convId: G1,
+    from: 'bob',
+    type: 'text',
+    body: { text: 'x' },
+    ts: 1,
+    status: 'sent',
+    ...p,
+  });
+
+  async function ready(): Promise<[Harness, FakeConnection]> {
+    const h = setup(quiet);
+    current = h;
+    h.im.connect('t');
+    const c = await h.login('alice', [
+      conv({ convId: AB, modVer: 0, maxSeq: 5, readSeq: 5 }),
+      conv({ convId: G1, modVer: 0, memberCount: 3, myRole: 'admin', maxSeq: 6, readSeq: 5, unread: 1 }),
+    ]);
+    return [h, c];
+  }
+
+  it('别人发的、已发送的 text、image、file 可以；自己的、tip、custom、发送中、失败、没有 msgId 的不行', async () => {
+    const [h] = await ready();
+    for (const type of ['text', 'image', 'file'] as const) expect(h.im.canReport(base({ type })), type).toBe(true);
+    expect(h.im.canReport(base({ convId: AB }))).toBe(true);
+    const no: Array<[string, Partial<Message>]> = [
+      ['自己的', { from: 'alice' }],
+      ['tip', { type: 'tip', from: '' }],
+      ['custom', { type: 'custom' }],
+      ['发送中', { status: 'sending', msgId: undefined, seq: undefined }],
+      ['失败', { status: 'failed', msgId: undefined, seq: undefined, error: 5000 }],
+      ['没有 msgId', { msgId: undefined }],
+      ['没有 seq', { seq: undefined }],
+      ['状态不是 sent（有 msgId、seq 也不行）', { status: 'sending' }],
+      ['后台删除', { deleted: true, deletedAt: 9, body: {} }],
+    ];
+    for (const [name, p] of no) expect(h.im.canReport(base(p)), name).toBe(false);
+  });
+
+  it('撤回提示行：别人自己撤回的、撤回者未知的可以；我（管理员）撤回的、我自己的消息被别人撤回的不行', async () => {
+    const [h] = await ready();
+    const recalled = (p: Partial<Message>) => base({ deleted: true, recalled: true, recalledAt: 9, body: {}, ...p });
+    expect(h.im.canReport(recalled({ recalledBy: 'bob' }))).toBe(true);
+    expect(h.im.canReport(recalled({}))).toBe(true); // 老服务端 recalledBy 为空：按别人撤回（第 89 条）
+    expect(h.im.canReport(recalled({ recalledBy: 'carol' }))).toBe(true);
+    expect(h.im.canReport(recalled({ recalledBy: 'alice' }))).toBe(false); // 我以管理员身份撤回的（第 89 条）
+    expect(h.im.canReport(recalled({ from: 'alice', recalledBy: 'bob' }))).toBe(false); // 第 92 条
+  });
+
+  it('只有本机看过的（seq ≤ readSeq）；readUpdated 之后可以；会话不在本地列表、没连上过的不行（第 92 条）', async () => {
+    const [h, c] = await ready();
+    expect(h.im.canReport(base({ seq: 5 }))).toBe(true);
+    expect(h.im.canReport(base({ seq: 6 }))).toBe(false);
+    down(c, { cmd: 'event', data: { type: 'readUpdated', convId: G1, readSeq: 6 } });
+    await flush();
+    expect(h.im.canReport(base({ seq: 6 }))).toBe(true);
+    expect(h.im.canReport(base({ convId: 'group:gx', seq: 1 }))).toBe(false);
+    expect(setup().im.canReport(base({}))).toBe(false); // 还不知道自己是谁
+  });
+
+  it('真实流程：加载的消息被别人撤回（msgDeleted.recalled）后提示行仍可举报；我撤回的不行', async () => {
+    const [h, c] = await ready();
+    void h.im.loadHistory(G1);
+    await flush();
+    const mk = (seq: number) => ({
+      msgId: `g1-${seq}`,
+      clientMsgId: `bob-${seq}`,
+      convId: G1,
+      seq,
+      from: 'bob',
+      type: 'text',
+      body: { text: `m${seq}` },
+      ts: 1000 + seq,
+    });
+    ackOk(c, 'sync', { messages: [mk(4), mk(5)], hasMore: false });
+    await flush();
+    const at = (seq: number) => h.im.messages(G1).find((m) => m.seq === seq)!;
+    expect(h.im.canReport(at(4))).toBe(true);
+    const del = (seq: number, by: string) =>
+      down(c, {
+        cmd: 'event',
+        data: { type: 'msgDeleted', convId: G1, msgIds: [`g1-${seq}`], seqs: [seq], recalled: { by, at: 9 } },
+      });
+    del(4, 'bob');
+    del(5, 'alice');
+    await flush();
+    expect(at(4)).toMatchObject({ recalled: true, recalledBy: 'bob' });
+    expect(h.im.canReport(at(4))).toBe(true);
+    expect(h.im.canReport(at(5))).toBe(false);
+  });
+});

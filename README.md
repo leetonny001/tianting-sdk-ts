@@ -158,6 +158,7 @@ im.on('convDeleted', (convId) => …);            // 本端删除成功或其他
 const reportId = await im.report({ targetType: 'message', convId, msgIds: [msgId], reason: 'abuse', note }); // 第一批页面只举报单条
 await im.report({ targetType: 'user', userId, reason: 'spam' });
 await im.report({ targetType: 'group', groupId, reason: 'illegal' });
+im.canReport(m);                                // 消息菜单、撤回提示行有没有"举报"（三套 SDK 同一口径，问题 77、88、89、92）
 im.canRetry(m);                                 // 失败气泡有没有"重发"：4510（内容被拦截）和 sourceMissing 没有，只有"复制""删除"
 messageFor('send', 4510);                       // "消息包含不当内容，无法发送"；其他命令和账号接口："内容包含不当信息，请修改后重试"
 ```
@@ -168,6 +169,9 @@ messageFor('send', 4510);                       // "消息包含不当内容，�
 不自动重试（文案 `messageFor('report', code)`）。`note` 不进日志和错误信息。入口按 `features.moderation`（老服务端没有，按关闭）；4510 的提示和它无关。
 `send`、`sendImage`、`sendFile` 收到 4510：消息标记失败、`error = 4510`，不自动重发，`retry` 也不发（超时之后才到的 4510 同样改成 4510）；
 错误里没有命中的词。账号接口（注册、改昵称）的 4510 以 `AccountError {status: 451, code: 4510}` 原样抛出。
+`canReport`：别人发的、已经发送成功的 `text`、`image`、`file`，而且本机看过（`seq ≤` 会话的 `readSeq`，会话不在本地列表时没有）；
+自己的、`tip`、`custom`、发送中和失败的、后台删除的没有。撤回提示行只在别人撤回的消息上有：我（群主、管理员）撤回的没有，
+我自己的消息被别人撤回也没有，撤回者未知（`recalledBy` 为空）按别人撤回。不看 `features.moderation`，开关由页面判断。
 
 ## 删除失败的消息（PRD-ui G-UI-14）
 

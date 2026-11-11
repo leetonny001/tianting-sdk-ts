@@ -39,8 +39,10 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 /** 记下收到的每一帧（ack、pong 之外的就是推送和事件）。 */
 class RecordingTransport extends WebSocketTransport {
   readonly inbound: Array<{ cmd: string; at: number }> = [];
+  /** 发出的每一帧（原文）。 */
+  readonly sent: string[] = [];
   override open(url: string, h: TransportHandlers): TransportConnection {
-    return super.open(url, {
+    const conn = super.open(url, {
       ...h,
       onMessage: (text) => {
         try {
@@ -51,6 +53,13 @@ class RecordingTransport extends WebSocketTransport {
         h.onMessage(text);
       },
     });
+    return {
+      send: (text) => {
+        this.sent.push(text);
+        conn.send(text);
+      },
+      close: (code, reason) => conn.close(code, reason),
+    };
   }
   pushedSince(t: number): string[] {
     return this.inbound.filter((f) => f.at >= t && f.cmd !== 'ack' && f.cmd !== 'pong').map((f) => f.cmd);
@@ -86,6 +95,16 @@ function harness(getSrv: () => RunningServer) {
   };
 }
 
+/** 打开会话、加载历史并上报已读，等到本地 readSeq 到 seq（服务端的举报要求看过，第 92 条）。返回本地的那条消息。 */
+async function readAll(im: IMClient, convId: string, seq: number): Promise<Message> {
+  await until(() => im.conversations().find((c) => c.convId === convId), `${convId} listed`);
+  await im.loadHistory(convId);
+  im.setActiveConversation(convId);
+  await until(() => (im.conversations().find((c) => c.convId === convId)?.readSeq ?? 0) >= seq, `read ${seq}`);
+  im.setActiveConversation(null);
+  return until(() => im.messages(convId).find((m) => m.seq === seq), `msg ${seq}`);
+}
+
 async function sent(im: IMClient, convId: string, text: string): Promise<Message> {
   const r = im.send(convId, text);
   if (!r.ok) throw new Error('send');
@@ -111,14 +130,16 @@ describe('举报 × 真实服务端（BE-495）', () => {
     expect(cfg.features.moderation).toBe(true);
   });
 
-  it('TC-MOD-03-01（AC-MOD-03-1 的客户端侧）：u2 举报 u1 的单聊消息（abuse）成功，返回 reportId；2 秒内 u1、u2 都收不到任何帧；重复提交返回同一个 reportId', async () => {
+  it('TC-MOD-03-01（AC-MOD-03-1 的客户端侧）：u2 看过 u1 的单聊消息后 canReport 为 true，举报（abuse）成功，返回 reportId；2 秒内 u1、u2 都收不到任何帧；重复提交返回同一个 reportId', async () => {
     const [u1, u2] = [uid('ra'), uid('rb')];
     await t.users(u1, u2);
     const conv = c2cConvId(u1, u2);
     const [a, b] = [await t.login(u1), await t.login(u2)];
     const m = await sent(a, conv, 'ZXQ-RPT-3 被举报的消息');
-    await until(() => b.conversations().find((c) => c.convId === conv), 'u2 has conv');
-    await sleep(300); // 发送带来的推送先收完
+    const seen = await readAll(b, conv, m.seq!);
+    expect(b.canReport(seen)).toBe(true);
+    expect(a.canReport(m)).toBe(false); // 自己的
+    await sleep(300); // 发送、已读带来的推送先收完
     const t0 = Date.now();
     const id = await b.report({
       targetType: 'message',
@@ -134,30 +155,45 @@ describe('举报 × 真实服务端（BE-495）', () => {
     expect(await b.report({ targetType: 'message', convId: conv, msgIds: [m.msgId!], reason: 'abuse' })).toBe(id);
   });
 
-  it('举报用户、群：成功；非参与者举报消息、举报不存在的用户都是 4040 reportTargetInvalid（响应相同）', async () => {
-    const [u1, u2, u3] = [uid('rc'), uid('rd'), uid('re')];
-    await t.users(u1, u2, u3);
+  it('举报用户、群：成功；非成员举报群消息、举报不存在的用户都是 4040 reportTargetInvalid（响应相同）；不是参与者的单聊本地就是 4000，不发帧（问题 91）', async () => {
+    const [u1, u2, u3, u4] = [uid('rc'), uid('rd'), uid('re'), uid('rf')];
+    await t.users(u1, u2, u3, u4);
     const conv = c2cConvId(u1, u2);
     const [a, b, c] = [await t.login(u1), await t.login(u2), await t.login(u3)];
     const m = await sent(a, conv, 'ZXQ-RPT-4');
     await until(() => b.conversations().find((x) => x.convId === conv), 'u2 has conv');
     expect(await b.report({ targetType: 'user', userId: u1, reason: 'spam' })).toMatch(ID);
-    const { groupId } = await a.createGroup({ name: 'ZXQ 举报群', members: [u2] });
-    await until(() => b.conversations().find((x) => x.convId === `group:${groupId}`), 'u2 in group');
+    const groupId = uid('rg');
+    await srv.admin('POST', '/admin/groups', { groupId, name: 'ZXQ 举报群', members: [u1, u2, u4] });
+    const g = `group:${groupId}`;
+    await until(() => b.conversations().find((x) => x.convId === g), 'u2 in group');
     expect(await b.report({ targetType: 'group', groupId, reason: 'illegal' })).toMatch(ID);
+    const gm = await sent(a, g, 'ZXQ-RPT-5 群消息');
+    expect(b.canReport(await readAll(b, g, gm.seq!))).toBe(true);
+    expect(await b.report({ targetType: 'message', convId: g, msgIds: [gm.msgId!], reason: 'spam' })).toMatch(ID);
 
     const errOf = (p: Promise<unknown>) =>
       p.then(
         () => null,
         (e: unknown) => e,
       );
-    const e1 = await errOf(c.report({ targetType: 'message', convId: conv, msgIds: [m.msgId!], reason: 'abuse' }));
+    const e1 = await errOf(c.report({ targetType: 'message', convId: g, msgIds: [gm.msgId!], reason: 'abuse' }));
     const e2 = await errOf(c.report({ targetType: 'user', userId: uid('nobody'), reason: 'abuse' }));
     for (const e of [e1, e2]) {
       expect(e).toBeInstanceOf(IMError);
       expect(e).toMatchObject({ code: 4040, reason: 'reportTargetInvalid' });
     }
     expect((e1 as IMError).message).toBe((e2 as IMError).message);
+    const before = t.transportOf(c).sent.length;
+    const e3 = await errOf(c.report({ targetType: 'message', convId: conv, msgIds: [m.msgId!], reason: 'abuse' }));
+    expect(e3).toBeInstanceOf(IMError);
+    expect(e3).toMatchObject({ code: 4000, details: { field: 'convId' } });
+    expect(
+      t
+        .transportOf(c)
+        .sent.slice(before)
+        .filter((s) => s.includes('"report"')),
+    ).toEqual([]);
   });
 });
 
@@ -217,10 +253,10 @@ describe('4510 × 真实服务端（BE-493、BE-494）', () => {
   });
 
   it('建群的群名含特征词：IMError 4510 原样抛出，不带 details', async () => {
-    const [u1, u2] = [uid('bc'), uid('bd')];
-    await t.users(u1, u2);
+    const [u1, u2, u3] = [uid('bc'), uid('bd'), uid('bf')];
+    await t.users(u1, u2, u3);
     const a = await t.login(u1);
-    const e = await a.createGroup({ name: `群 ${WORD}`, members: [u2] }).catch((x: unknown) => x);
+    const e = await a.createGroup({ name: `群 ${WORD}`, members: [u2, u3] }).catch((x: unknown) => x);
     expect(e).toBeInstanceOf(IMError);
     expect(e).toMatchObject({ code: 4510, details: undefined });
   });
